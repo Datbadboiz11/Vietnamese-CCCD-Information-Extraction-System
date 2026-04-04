@@ -835,7 +835,7 @@ OCR
 ## Cấu trúc thư mục hệ thống
 
 ```text
-id-card-ie/
+Extraction ID Card/
 ├─ configs/
 │  ├─ train_detector.yaml
 │  ├─ train_field_detector.yaml
@@ -844,9 +844,12 @@ id-card-ie/
 │  ├─ augmentation.yaml
 │  └─ tta.yaml
 ├─ data/
-│  ├─ raw/                              # Dữ liệu gốc Roboflow, KHÔNG chỉnh sửa
+│  ├─ cccd.v1i.coco/                    # Dữ liệu gốc Roboflow 
+│  │  ├─ train/
+│  │  ├─ valid/
+│  │  └─ test/
 │  ├─ interim/
-│  │  ├─ dedup_clusters.json            # Kết quả dedup
+│  │  ├─ dedup_clusters.json
 │  │  ├─ dedup_report.md
 │  │  ├─ annotation_quality_report.md
 │  │  ├─ flagged_images.json
@@ -863,33 +866,35 @@ id-card-ie/
 │  │  │  └─ reviewed.jsonl
 │  │  └─ e2e/                           # Manifest pipeline IE
 │  ├─ annotations/
-│  └─ augmentation_assets/              # Tài nguyên cho custom augmentation
-│     ├─ textures/                      # 50-100 ảnh nền (bàn gỗ, vải, giấy...)
-│     ├─ distraction_cards/             # 20-30 ảnh thẻ khác (fake/template)
-│     └─ bg_textures/                   # 10-20 mẫu nền thẻ CCCD (crop từ dataset)
+│  └─ augmentation_assets/
+│     ├─ textures/
+│     ├─ distraction_cards/
+│     └─ bg_textures/
 ├─ scripts/
 │  ├─ data_quality/
 │  │  ├─ dedup_images.py
 │  │  ├─ check_annotations.py
-│  │  ├─ dataset_stats.py
-│  │  └─ split_dataset.py
-│  ├─ convert_coco_dataset.py
-│  ├─ crop_fields.py
-│  ├─ generate_pseudo_labels.py
-│  ├─ train_detector.py
-│  ├─ train_field_detector.py
-│  ├─ train_ocr.py
-│  ├─ run_infer.py
-│  ├─ run_infer_video.py
-│  └─ evaluate.py
+│  │  ├─ dataset_stats.ipynb            
+│  │  └─ split_dataset.ipynb           
+│  ├─ detection/                        # subfolder cho notebook detection
+│  │  ├─ 01_prepare_yolo_data.ipynb
+│  │  ├─ 02_train_card_detector.ipynb
+│  │  └─ 03_train_field_detector.ipynb
+│  ├─ crop_fields.ipynb
+│  ├─ generate_pseudo_labels.ipynb
+│  ├─ train_ocr.ipynb
+│  ├─ run_infer.ipynb
+│  ├─ run_infer_video.ipynb
+│  └─ evaluate.ipynb
 ├─ src/
-│  ├─ common/                           # Logger, config loader, utils
+│  ├─ common/
 │  ├─ data/
 │  │  ├─ dataset.py
-│  │  ├─ transforms.py                  # Albumentations pipelines
-│  │  └─ custom_augmentations.py        # Specular, finger, uneven light
-│  ├─ detection/                        # Card detector + field detector
+│  │  ├─ transforms.py
+│  │  └─ custom_augmentations.py
+│  ├─ detection/
 │  ├─ preprocessing/
+│  │  ├─ __init__.py
 │  │  ├─ rectify.py                     # Corner finding + perspective warp
 │  │  ├─ orientation.py                 # 0°/90°/180°/270° detection
 │  │  ├─ enhance.py                     # CLAHE, denoise, quality score
@@ -897,32 +902,40 @@ id-card-ie/
 │  ├─ ocr/
 │  │  ├─ vietocr_adapter.py
 │  │  ├─ paddleocr_adapter.py
-│  │  └─ ensemble.py                    # OCR ensemble logic
+│  │  └─ ensemble.py
 │  ├─ parsing/
 │  │  ├─ field_mapping.py
-│  │  ├─ validators.py                  # Soft/hard rules
+│  │  ├─ validators.py
 │  │  └─ confidence_router.py
 │  ├─ pipeline/
 │  │  ├─ image_pipeline.py
 │  │  ├─ video_pipeline.py
 │  │  ├─ tta.py
-│  │  └─ error_recovery.py             # Decision tree logic
+│  │  └─ error_recovery.py
 │  └─ evaluation/
 │      ├─ detection_metrics.py
 │      ├─ ocr_metrics.py
 │      ├─ e2e_metrics.py
 │      ├─ error_analysis.py
 │      └─ augmentation_ablation.py
+├─ model/                               # thay vì models/
+│  ├─ card_detector/
+│  │  ├─ best.pt
+│  │  └─ eval_results.json
+│  └─ field_detector/
+│     ├─ best.pt
+│     └─ eval_results.json
 ├─ demo/
 ├─ docs/
 │  ├─ annotation_guide.md
 │  ├─ augmentation_guide.md
 │  ├─ data_quality_report.md
 │  └─ final_report.md
-├─ models/
 ├─ outputs/
 ├─ experiments/
-└─ requirements.txt
+├─ requirements.txt
+├─ PLAN.md
+└─ README.md
 ```
 
 ---
@@ -1278,32 +1291,3 @@ CCCD chứa thông tin cá nhân nhạy cảm. Dù là PoC học thuật, cần 
 - Privacy: inference local, không upload cloud, không commit ảnh vào Git.
 
 ---
-
-## Tóm tắt toàn bộ cải tiến so với plan gốc
-
-| # | Cải tiến | Lý do |
-|---|---|---|
-| 1 | Nguồn dataset cụ thể + xử lý vấn đề stretch/split | Dataset Roboflow bị stretch méo, split không cân |
-| 2 | Data Quality Pipeline 5 bước (dedup, annotation check, stats, split) | Tránh train trên data lỗi, ngăn data leakage |
-| 3 | Tiêu chí chuyển giao Detection → OCR (mAP gate) | Tránh garbage in garbage out |
-| 4 | Chiến lược OCR chi tiết: phân tách field, thứ tự fine-tune, ensemble, retry | Mỗi field cần chiến lược khác nhau |
-| 5 | Pseudo-label workflow giảm 60-70% công annotation | Semi-auto hiệu quả hơn manual |
-| 6 | Letterbox resize thay vì stretch | Giữ tỷ lệ thẻ, bbox chính xác |
-| 7 | Orientation Detection module | Xử lý ảnh xoay 90°/180° |
-| 8 | Rectification fallback chain (keypoint→contour→hough→crop) | Plan gốc chỉ có contour, dễ fail |
-| 9 | Post-processing rules mềm (soft warning > hard reject) | Tránh loại nhầm edge case |
-| 10 | Error Recovery decision tree | Pipeline luôn cho ra kết quả partial thay vì crash |
-| 11 | Augmentation 6 nhóm domain-aware + 10 custom CCCD aug + OCR aug riêng | Cover toàn bộ degradation thực tế, không chỉ augmentation generic |
-| 12 | Nhóm 5 Context & Background (thay nền, multi-card distraction) | Dataset thường nền sạch, thực tế nền đa dạng — lỗ hổng lớn nhất |
-| 13 | Nhóm 4 mở rộng (scratch, local fade, local overexposure) | Thẻ cũ hư hỏng, flash chụp gần — rất phổ biến thực tế |
-| 14 | Moiré simulation, grayscale/channel shuffle | Chụp qua màn hình, app scan B&W |
-| 15 | Compose 4 level (Light/Medium/Heavy/Extreme) thay vì 3 | Thêm Extreme 10% mô phỏng worst case, compound degradation |
-| 16 | OCR augmentation mở rộng (background noise, line through, BrightnessContrast, compression) | OCR crop thực tế không có nền sạch |
-| 17 | Tài nguyên thu thập cho custom aug (textures, distraction cards, bg textures) | Custom aug cần assets thực tế |
-| 14 | TTA với auto-trigger + time budget | Tăng robustness khi ảnh khó, có kiểm soát thời gian |
-| 15 | Video pipeline (adaptive sampling + quality scoring + ensemble + edge cases) | Hỗ trợ video thực tế |
-| 16 | Augmentation ablation study | Chứng minh giá trị augmentation cho báo cáo |
-| 17 | Real-world validation (20-50 ảnh ngoài dataset) | Kiểm tra generalization gap |
-| 18 | Demo hiển thị intermediate steps | Debug + minh họa cho báo cáo |
-| 19 | Privacy & Security guidelines | CCCD chứa thông tin nhạy cảm, cần cho ethical review |
-| 20 | Citation dataset + license | Yêu cầu bắt buộc cho báo cáo học thuật |
