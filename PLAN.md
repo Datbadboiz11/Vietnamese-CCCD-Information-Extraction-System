@@ -1057,44 +1057,47 @@ evaluate.py
 
 ## Phân chia công việc cho 3 người
 
-### Người 1: Data & Annotation
+### Người 1: Data & Detection
 
 Phụ trách:
-- Kiểm tra chất lượng dataset hiện có
-- Chuyển COCO sang manifest dùng trong project
-- Crop field từ bbox
-- Gán transcript OCR cho field crop
-- Tạo split train/val/test cho OCR
+- Data Quality Pipeline: dedup, kiểm tra annotation, thống kê dataset, split 70/15/15
+- Train Card Detector (YOLOv11, 1 class)
+- Train Field Detector (YOLOv11, 6 class)
+- Benchmark detection metrics (mAP, precision, recall, confusion matrix)
+- Viết phần data & detection cho báo cáo
 
 Deliverables:
-- `data/processed/detector/*`
-- `data/processed/field_detector/*`
-- `data/processed/ocr/*`
-- `docs/annotation_guide.md`
-- thống kê dữ liệu cho báo cáo
+- `data/processed/splits/` (train/val/test JSON)
+- `model/card_detector/best.pt` + `eval_results.json`
+- `model/field_detector/best.pt` + `eval_results.json`
+- `scripts/data_quality/*`, `scripts/detection/*`
+- thống kê dữ liệu + bảng metric detection cho báo cáo
 
-### Người 2: Detection & OCR
+### Người 2: Image Processing & OCR
 
 Phụ trách:
-- Train `card detector`
-- Train `field detector`
-- Tích hợp PaddleOCR/VietOCR
-- Benchmark detector/OCR
+- Module Rectification (perspective warp thẻ về 856×540)
+- Module Image Enhancement (CLAHE, denoising)
+- Pseudo-label workflow: chạy VietOCR + PaddleOCR, review transcript
+- Tích hợp OCR pipeline (ensemble VietOCR + PaddleOCR)
+- Benchmark OCR (CER/WER per field)
 
 Deliverables:
-- code trong `src/detection/*`, `src/ocr/*`
-- checkpoint detector/OCR
-- bảng metric detection/OCR
+- `src/rectification/*`
+- `src/enhancement/*`
+- `src/ocr/*`
+- `data/processed/ocr/` (field crops + reviewed transcripts)
+- bảng metric OCR cho báo cáo
 
 ### Người 3: Parsing, Integration & Demo
 
 Phụ trách:
-- Mapping class -> field chuẩn
-- Rule validation và hậu xử lý
-- Pipeline end-to-end
-- Evaluation script
-- Demo app
-- Gom báo cáo cuối
+- Mapping class → field chuẩn (id_number, full_name, ...)
+- Rule validation và hậu xử lý (regex, fuzzy match tỉnh/thành)
+- Pipeline end-to-end (nối tất cả các module)
+- Evaluation framework (exact match, fuzzy match, e2e metrics)
+- Demo app (Gradio/Streamlit)
+- Tổng hợp báo cáo cuối
 
 Deliverables:
 - `src/parsing/*`
@@ -1109,28 +1112,29 @@ Deliverables:
 
 ```
 Tuần 1:
-  Người 1: Tải raw data + Data Quality pipeline (dedup, check annotations, stats, split)
-  Người 2: Setup env + implement augmentation pipeline + custom augmentations
+  Người 1: Data Quality pipeline (dedup, check annotations, stats, split) → output: splits/
+  Người 2: Nghiên cứu Rectification + Enhancement, setup PaddleOCR/VietOCR môi trường
   Người 3: Viết parsing rules (soft/hard) + validation logic + error recovery decision tree
 
 Tuần 2:
-  Người 1: Crop fields + chạy pseudo-label + bắt đầu review transcript
-  Người 2: Train card detector + field detector (cần split từ Người 1 tuần 1)
-            *** Checkpoint: detection đạt target mAP → chuyển sang OCR ***
-  Người 3: Viết pipeline skeleton (image + video) + TTA module + evaluation framework
+  Người 1: Train card detector + field detector (dùng splits/ từ tuần 1)
+            *** Checkpoint: detection đạt mAP@0.5 ≥ 0.85 (card), ≥ 0.75 (field) ***
+  Người 2: Implement Rectification + Enhancement (dùng ảnh test thủ công)
+            Crop fields từ bbox GT + chạy pseudo-label + bắt đầu review transcript
+  Người 3: Viết pipeline skeleton + evaluation framework + TTA module
 
 Tuần 3:
-  Người 1: Hoàn thành review OCR labels + thống kê + viết data quality report
-  Người 2: Tích hợp OCR (VietOCR + PaddleOCR ensemble) + benchmark + augmentation ablation
-  Người 3: Nối pipeline end-to-end + video pipeline + test error recovery
+  Người 1: Hỗ trợ Người 2 review transcript + viết data quality report + ablation detection
+  Người 2: Tích hợp OCR ensemble + benchmark CER/WER + hoàn thành reviewed transcripts
+  Người 3: Nối pipeline end-to-end + test error recovery + video pipeline
 
 Tuần 4:
-  Người 1: Hỗ trợ test real-world ảnh + viết phần data/augmentation cho báo cáo
-  Người 2: Fine-tune OCR nếu kịp + so sánh TTA + finalize metrics
+  Người 1: Test real-world ảnh + viết phần data/detection cho báo cáo + finalize metrics
+  Người 2: Fine-tune VietOCR nếu kịp + so sánh TTA OCR + viết phần OCR cho báo cáo
   Người 3: Demo app (upload ảnh + video + hiển thị intermediate steps) + tổng hợp báo cáo
 ```
 
-**Bottleneck chính:** Người 1 phải hoàn thành data quality + split trong tuần 1 để Người 2 bắt đầu train.
+**Bottleneck chính:** Người 1 phải hoàn thành split trong tuần 1 để Người 2 bắt đầu train. Detection phải PASS trước tuần 3 để Người 3 nối pipeline.
 
 ---
 
