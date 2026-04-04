@@ -1,0 +1,92 @@
+{
+  "total_images": 4399,
+  "total_annotations": 30854,
+  "categories": {
+    "0": "cccd",
+    "1": "address",
+    "2": "birth",
+    "3": "card",
+    "4": "id",
+    "5": "name",
+    "6": "origin",
+    "7": "title"
+  },
+  "split_counts": {
+    "train": 3846,
+    "valid": 366,
+    "test": 187
+  },
+  "image_sizes": {
+    "width": {
+      "mean": 640.0,
+      "std": 0.0,
+      "min": 640,
+      "max": 640
+    },
+    "height": {
+      "mean": 640.0,
+      "std": 0.0,
+      "min": 640,
+      "max": 640
+    },
+    "aspect_ratio": {
+      "mean": 1.0,
+      "std": 0.0
+    }
+  },
+  "annotations_per_image": {
+    "mean": 9.379404410093203,
+    "std": 4.887499399905533,
+    "min": 0,
+    "max": 23,
+    "images_with_0": 3
+  },
+  "bbox_per_class": {
+    "address": {
+      "count": 4383,
+      "area_mean": 27467.444444444445,
+      "area_std": 9610.525301538933
+    },
+    "birth": {
+      "count": 4403,
+      "area_mean": 4058.069214172155,
+      "area_std": 1514.2393199876187
+    },
+    "card": {
+      "count": 4382,
+      "area_mean": 256658.92925604747,
+      "area_std": 62542.77319867379
+    },
+    "id": {
+      "count": 4399,
+      "area_mean": 8940.713855421687,
+      "area_std": 3604.3159786236506
+    },
+    "name": {
+      "count": 4428,
+      "area_mean": 11267.377032520326,
+      "area_std": 6300.034310983341
+    },
+    "origin": {
+      "count": 4459,
+      "area_mean": 21751.056458847273,
+      "area_std": 9929.412409739893
+    },
+    "title": {
+      "count": 4400,
+      "area_mean": 15732.969943181819,
+      "area_std": 5525.418023533841
+    }
+  },
+  "brightness_contrast": {
+    "brightness": {
+      "mean": 140.27091657881303,
+      "std": 36.6496421957956
+    },
+    "contrast": {
+      "mean": 49.620115132869714,
+      "std": 12.72213567105794
+    },
+    "sample_size": 880
+  }
+}
