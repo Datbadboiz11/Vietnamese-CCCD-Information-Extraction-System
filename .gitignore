@@ -1,0 +1,19 @@
+# Dataset gốc (nặng)
+data/cccd.v1i.coco/
+data/cccd.v1i.coco.zip
+data/yolo/
+cccd_data.zip
+
+# Ảnh crop (nặng, tái tạo được từ crop_fields.ipynb)
+data/interim/cropped_fields/**/*.jpg
+
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
+Thumbs.db
