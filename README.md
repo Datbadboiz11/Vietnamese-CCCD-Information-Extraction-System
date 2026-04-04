@@ -15,8 +15,8 @@ PoC học thuật cho bài toán trích xuất thông tin từ Căn Cước Côn
 │   ├── cccd.v1i.coco/          # Dataset gốc từ Roboflow (COCO format)
 │   │   ├── train/              # 3846 ảnh (Roboflow split gốc)
 │   │   ├── valid/              # 366 ảnh
-│   │   └── test/              # 187 ảnh
-│   ├── interim/                # Output trung gian từ Data Quality Pipeline
+│   │   └── test/               # 187 ảnh
+│   ├── interim/                # Output từ Data Quality Pipeline
 │   │   ├── dedup_clusters.json
 │   │   ├── dedup_report.md
 │   │   ├── annotation_quality_report.md
@@ -25,17 +25,35 @@ PoC học thuật cho bài toán trích xuất thông tin từ Căn Cước Côn
 │   │   ├── dataset_statistics_plots/
 │   │   └── split_report.md
 │   └── processed/
-│       └── splits/             # Split sạch để train (dùng cái này)
+│       └── splits/             # Split sạch để train
 │           ├── train.json      # 3074 ảnh (70%)
 │           ├── val.json        # 699 ảnh (15%)
 │           └── test.json       # 626 ảnh (15%)
 │
 ├── scripts/
-│   └── data_quality/
-│       ├── dedup_images.py     # Bước 2: pHash dedup + cluster theo base name
-│       ├── check_annotations.py # Bước 3: Kiểm tra chất lượng annotation
-│       ├── dataset_stats.ipynb # Bước 4: Thống kê & biểu đồ phân bố
-│       └── split_dataset.ipynb # Bước 5: Split 70/15/15 theo cluster
+│   ├── data_quality/
+│   │   ├── dedup_images.py
+│   │   ├── check_annotations.py
+│   │   ├── dataset_stats.ipynb
+│   │   └── split_dataset.ipynb
+│   └── detection/
+│       ├── 01_prepare_yolo_data.ipynb
+│       ├── 02_train_card_detector.ipynb
+│       └── 03_train_field_detector.ipynb
+│
+├── src/
+│   └── preprocessing/
+│       ├── rectify.py          # Perspective warp → 856×540
+│       ├── enhance.py          # CLAHE, denoising (TODO)
+│       └── orientation.py      # Rotation detection (TODO)
+│
+├── model/
+│   ├── card_detector/
+│   │   ├── best.pt             # mAP@0.5 = 0.995
+│   │   └── eval_results.json
+│   └── field_detector/
+│       ├── best.pt             # mAP@0.5 = 0.995
+│       └── eval_results.json
 │
 ├── PLAN.md                     # Thiết kế chi tiết toàn bộ hệ thống
 └── README.md
@@ -51,7 +69,9 @@ PoC học thuật cho bài toán trích xuất thông tin từ Căn Cước Côn
 
 Split Roboflow gốc bị data leakage (347/769 cluster bị tách cross-split). Dùng `data/processed/splits/` — đã re-split sạch theo cluster.
 
-## Kết quả Data Quality
+## Kết quả
+
+### Data Quality
 
 | Chỉ số | Kết quả |
 |---|---|
@@ -61,11 +81,18 @@ Split Roboflow gốc bị data leakage (347/769 cluster bị tách cross-split).
 | Split train/val/test | 3074 / 699 / 626 |
 | Data leakage sau re-split | **0** |
 
+### Detection
+
+| Model | mAP@0.5 | mAP@0.5:95 | Precision | Recall |
+|---|---|---|---|---|
+| Card Detector (1 class) | **0.995** | 0.907 | 0.9998 | 1.000 |
+| Field Detector (6 class) | **0.995** | 0.849 | 0.9995 | 0.997 |
+
 ## Lộ trình phát triển
 
 - [x] Data Quality Pipeline (dedup, annotation check, stats, split)
-- [ ] Lớp 1 — Card Detection (YOLOv8/v11, mAP@0.5 ≥ 0.85)
-- [ ] Lớp 1 — Field Localization (YOLOv8/v11, mAP@0.5 ≥ 0.75)
+- [x] Lớp 1 — Card Detection (YOLOv11s, mAP@0.5 = 0.995)
+- [x] Lớp 1 — Field Localization (YOLOv11s, mAP@0.5 = 0.995)
 - [ ] Module Rectification (perspective warp → 856×540)
 - [ ] Module Image Enhancement (CLAHE, denoising)
 - [ ] Lớp 2 — OCR (PaddleOCR cho số, VietOCR cho tiếng Việt)
