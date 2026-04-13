@@ -4,8 +4,7 @@ Warp thẻ CCCD về kích thước chuẩn 856×540px (tỷ lệ 85.6mm × 54mm
 
 Chiến lược tìm 4 góc (theo thứ tự ưu tiên):
   1. Contour + approxPolyDP  — primary
-  2. Hough Line Detection    — fallback
-  3. Bbox crop + padding 5%  — last resort
+  2. Bbox crop + padding 5%  — last resort
 """
 
 from dataclasses import dataclass
@@ -21,7 +20,7 @@ CARD_H = 540
 @dataclass
 class RectifyResult:
     image: np.ndarray      # ảnh đã warp (856×540)
-    method: str            # "contour" | "hough" | "bbox_crop"
+    method: str            # "contour" | "bbox_crop"
     corners: np.ndarray    # 4 góc tìm được, shape (4, 2), dtype float32
     failed: bool = False   # True nếu phải dùng last resort
 
@@ -51,7 +50,7 @@ def _warp(image: np.ndarray, corners: np.ndarray) -> np.ndarray:
 
 
 def _try_contour(image: np.ndarray, bbox: tuple) -> Optional[np.ndarray]:
-    x1, y1, x2, y2 = bbox
+    x1, y1, x2, y2 = (int(v) for v in bbox)
     h, w = image.shape[:2]
     pad_x = int((x2 - x1) * 0.10)
     pad_y = int((y2 - y1) * 0.10)
@@ -79,50 +78,6 @@ def _try_contour(image: np.ndarray, bbox: tuple) -> Optional[np.ndarray]:
     return None
 
 
-def _try_hough(image: np.ndarray, bbox: tuple) -> Optional[np.ndarray]:
-    x1, y1, x2, y2 = bbox
-    roi     = image[y1:y2, x1:x2]
-    gray    = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-    edged   = cv2.Canny(blurred, 50, 150)
-
-    lines = cv2.HoughLinesP(edged, 1, np.pi / 180, threshold=60,
-                             minLineLength=50, maxLineGap=10)
-    if lines is None or len(lines) < 4:
-        return None
-
-    h_lines, v_lines = [], []
-    for line in lines:
-        lx1, ly1, lx2, ly2 = line[0]
-        angle = abs(np.degrees(np.arctan2(ly2 - ly1, lx2 - lx1)))
-        if angle < 20 or angle > 160:
-            h_lines.append(line[0])
-        elif 70 < angle < 110:
-            v_lines.append(line[0])
-
-    if len(h_lines) < 2 or len(v_lines) < 2:
-        return None
-
-    h_lines.sort(key=lambda l: (l[1] + l[3]) / 2)
-    v_lines.sort(key=lambda l: (l[0] + l[2]) / 2)
-    top, bottom = h_lines[0], h_lines[-1]
-    left, right = v_lines[0], v_lines[-1]
-
-    def intersect(l1, l2):
-        x1_, y1_, x2_, y2_ = l1
-        x3,  y3,  x4,  y4  = l2
-        denom = (x1_ - x2_) * (y3 - y4) - (y1_ - y2_) * (x3 - x4)
-        if abs(denom) < 1e-6:
-            return None
-        t = ((x1_ - x3) * (y3 - y4) - (y1_ - y3) * (x3 - x4)) / denom
-        return [x1_ + t * (x2_ - x1_) + x1, y1_ + t * (y2_ - y1_) + y1]
-
-    pts = [intersect(top, left), intersect(top, right),
-           intersect(bottom, right), intersect(bottom, left)]
-    if any(p is None for p in pts):
-        return None
-    return np.array(pts, dtype=np.float32)
-
 
 def _bbox_crop(image: np.ndarray, bbox: tuple) -> tuple:
     x1, y1, x2, y2 = bbox
@@ -141,11 +96,6 @@ def rectify(image: np.ndarray, bbox: tuple) -> RectifyResult:
     if corners is not None:
         ordered = _order_corners(corners)
         return RectifyResult(image=_warp(image, ordered), method="contour", corners=ordered)
-
-    corners = _try_hough(image, bbox)
-    if corners is not None:
-        ordered = _order_corners(corners)
-        return RectifyResult(image=_warp(image, ordered), method="hough", corners=ordered)
 
     warped, corners = _bbox_crop(image, bbox)
     return RectifyResult(image=warped, method="bbox_crop", corners=corners, failed=True)
