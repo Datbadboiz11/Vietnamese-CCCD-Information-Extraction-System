@@ -1,26 +1,74 @@
+"""Generate OCR pseudo-labels from cropped field images.
+
+Default workflow:
+python scripts/generate_pseudo_labels.py
+
+This reads:
+- manifest from data/processed/ocr/manifest.jsonl
+
+This writes:
+- pseudo-labels to data/processed/ocr/pseudo_labels.jsonl
+"""
+
 from __future__ import annotations
 
 import argparse
 import json
-import os
-import sys
-from contextlib import ExitStack
-from dataclasses import asdict
+import logging
 from pathlib import Path
+from time import perf_counter
+from typing import Any
 
 import _bootstrap  # noqa: F401
-import cv2
-import numpy as np
 from tqdm import tqdm
 
-from src.ocr.ensemble import ensemble_predictions
-from src.ocr.paddleocr_adapter import PaddleOCRAdapter
-from src.ocr.utils import FIELD_NAME_MAP, TARGET_FIELDS, review_bucket
-from src.ocr.vietocr_adapter import VietOCRAdapter
+from src.ocr.ensemble import select_best_ocr_result
+from src.ocr.hybrid_line_pick import run_hybrid_field_ocr
+from src.ocr.paddleocr_adapter import PaddleOCRRecognizer
+from src.ocr.utils import canonicalize_field_name, empty_ocr_result, looks_suspicious_for_field
+from src.ocr.vietocr_adapter import VietOCRRecognizer
+
+LOGGER = logging.getLogger(__name__)
+HYBRID_FIELDS = {"place_of_origin", "place_of_residence"}
 
 
-def read_jsonl(path: Path) -> list[dict]:
-    rows: list[dict] = []
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Run VietOCR and PaddleOCR to generate pseudo-labels.")
+    parser.add_argument("--manifest", default="data/processed/ocr/manifest.jsonl")
+    parser.add_argument("--output", default="data/processed/ocr/pseudo_labels.jsonl")
+    parser.add_argument("--project-root", default=".")
+    parser.add_argument("--vietocr-config", default="vgg_transformer")
+    parser.add_argument("--vietocr-device", default="auto")
+    parser.add_argument("--paddle-lang", default="vi")
+    parser.add_argument("--paddle-device", default="auto")
+    parser.add_argument("--fields", nargs="*", default=None)
+    parser.add_argument("--limit", type=int, default=None)
+    parser.add_argument(
+        "--use-hybrid-long-text",
+        action="store_true",
+        help="Optionally refine origin/address with hybrid line-picking. Disabled by default because it can truncate valid text.",
+    )
+    parser.add_argument("--log-level", default="INFO")
+    return parser.parse_args()
+
+
+def configure_logging(level: str) -> None:
+    logging.basicConfig(
+        level=getattr(logging, level.upper(), logging.INFO),
+        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    )
+
+
+def review_bucket(confidence: float) -> str:
+    if confidence >= 0.9:
+        return "accept"
+    if confidence >= 0.5:
+        return "review"
+    return "reject"
+
+
+def read_jsonl(path: Path) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
     with path.open("r", encoding="utf-8-sig") as handle:
         for line in handle:
             line = line.strip()
@@ -29,15 +77,11 @@ def read_jsonl(path: Path) -> list[dict]:
     return rows
 
 
-def write_jsonl(path: Path, rows: list[dict]) -> None:
+def write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as handle:
         for row in rows:
             handle.write(json.dumps(row, ensure_ascii=False) + "\n")
-
-
-def write_jsonl_line(handle, row: dict) -> None:
-    handle.write(json.dumps(row, ensure_ascii=False) + "\n")
 
 
 def resolve_path(path_str: str, project_root: Path) -> Path:
@@ -47,218 +91,142 @@ def resolve_path(path_str: str, project_root: Path) -> Path:
 
 def to_portable_path(path: Path, project_root: Path) -> str:
     try:
-        relative = path.resolve().relative_to(project_root.resolve())
-        return relative.as_posix()
+        return path.resolve().relative_to(project_root.resolve()).as_posix()
     except ValueError:
-        return path.as_posix()
+        return path.resolve().as_posix()
 
 
-def disable_broken_proxy_env() -> list[str]:
-    disabled: list[str] = []
-    for key in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"):
-        value = os.environ.get(key, "")
-        if "127.0.0.1:9" in value or "localhost:9" in value:
-            os.environ.pop(key, None)
-            disabled.append(key)
-    return disabled
+def _pick_safer_result(field_name: str | None, baseline, hybrid):
+    canonical_field = canonicalize_field_name(field_name)
+    if hybrid is None or not hybrid.text.strip():
+        return baseline
+    if not baseline.text.strip():
+        return hybrid
+
+    baseline_bad = looks_suspicious_for_field(baseline.text, canonical_field)
+    hybrid_bad = looks_suspicious_for_field(hybrid.text, canonical_field)
+    baseline_score = float(baseline.confidence or 0.0)
+    hybrid_score = float(hybrid.confidence or 0.0)
+    baseline_len = len(baseline.text.strip())
+    hybrid_len = len(hybrid.text.strip())
+
+    if baseline_bad and not hybrid_bad:
+        return hybrid
+    if hybrid_bad and not baseline_bad:
+        return baseline
+
+    # Reject aggressive truncation unless confidence improves materially.
+    if hybrid_len < max(4, int(round(baseline_len * 0.60))) and hybrid_score < baseline_score + 0.10:
+        return baseline
+
+    if canonical_field in HYBRID_FIELDS:
+        if hybrid_score > baseline_score + 0.06 and hybrid_len >= max(4, int(round(baseline_len * 0.70))):
+            return hybrid
+        if hybrid_len > baseline_len + 6 and hybrid_score >= baseline_score - 0.02:
+            return hybrid
+        return baseline
+
+    return hybrid if hybrid_score > baseline_score + 0.05 else baseline
 
 
-def configure_utf8_stdio() -> None:
-    for stream_name in ("stdout", "stderr"):
-        stream = getattr(sys, stream_name, None)
-        if stream is not None and hasattr(stream, "reconfigure"):
-            try:
-                stream.reconfigure(encoding="utf-8")
-            except Exception:
-                pass
+def run_batch(
+    manifest_rows: list[dict[str, Any]],
+    *,
+    project_root: Path,
+    vietocr: VietOCRRecognizer,
+    paddleocr: PaddleOCRRecognizer,
+    use_hybrid_long_text: bool = False,
+) -> list[dict[str, Any]]:
+    from src.ocr.cropping import imread_unicode
 
+    output_rows: list[dict[str, Any]] = []
+    progress = tqdm(manifest_rows, desc="pseudo-labels", unit="crop")
+    for index, row in enumerate(progress, start=1):
+        crop_path = resolve_path(str(row["crop_path"]), project_root)
+        image = imread_unicode(crop_path)
+        if image is None:
+            LOGGER.warning("Could not read crop %s", crop_path)
+            viet_result = empty_ocr_result("vietocr")
+            paddle_result = empty_ocr_result("paddleocr")
+        else:
+            field_name = str(row.get("field_name") or "")
+            viet_result = vietocr.recognize(image, field_name=field_name)
+            paddle_result = paddleocr.recognize(image, field_name=field_name)
+            if use_hybrid_long_text and canonicalize_field_name(field_name) in HYBRID_FIELDS:
+                hybrid_viet_result, hybrid_paddle_result = run_hybrid_field_ocr(
+                    image=image,
+                    field_name=field_name,
+                    paddle_adapter=paddleocr,
+                    viet_adapter=vietocr,
+                )
+                viet_result = _pick_safer_result(field_name, viet_result, hybrid_viet_result)
+                paddle_result = _pick_safer_result(field_name, paddle_result, hybrid_paddle_result)
 
-def configure_local_model_cache(project_root: Path) -> Path:
-    cache_root = project_root / ".cache"
-    cache_root.mkdir(parents=True, exist_ok=True)
-    (cache_root / "torch").mkdir(parents=True, exist_ok=True)
-    (cache_root / "paddle").mkdir(parents=True, exist_ok=True)
-    (cache_root / "huggingface").mkdir(parents=True, exist_ok=True)
-    home_root = cache_root / "home"
-    home_root.mkdir(parents=True, exist_ok=True)
-    (home_root / ".cache" / "paddle" / "dataset").mkdir(parents=True, exist_ok=True)
+        best_result = select_best_ocr_result(row.get("field_name"), viet_result, paddle_result)
+        output_rows.append(
+            {
+                "crop_path": to_portable_path(crop_path, project_root),
+                "field_name": row.get("field_name"),
+                "image_path": row.get("image_path"),
+                "image_id": row.get("image_id"),
+                "split": row.get("split"),
+                "annotation_id": row.get("annotation_id"),
+                "ground_truth_text": row.get("ground_truth_text", ""),
+                "text_vietocr": viet_result.text,
+                "conf_vietocr": round(float(viet_result.confidence), 4),
+                "text_paddle": paddle_result.text,
+                "text_paddleocr": paddle_result.text,
+                "conf_paddle": round(float(paddle_result.confidence), 4),
+                "conf_paddleocr": round(float(paddle_result.confidence), 4),
+                "best_text": best_result.text,
+                "best_conf": round(float(best_result.confidence), 4),
+                "best_engine": best_result.engine,
+                "best_source": best_result.engine,
+                "needs_review": bool(best_result.needs_review),
+                "review_bucket": review_bucket(float(best_result.confidence)),
+            }
+        )
 
-    os.environ.setdefault("TORCH_HOME", str((cache_root / "torch").resolve()))
-    os.environ.setdefault("PADDLE_HOME", str((cache_root / "paddle").resolve()))
-    os.environ.setdefault("HF_HOME", str((cache_root / "huggingface").resolve()))
-    os.environ.setdefault("XDG_CACHE_HOME", str(cache_root.resolve()))
-    resolved_home = str(home_root.resolve())
-    resolved_home_path = home_root.resolve()
-    os.environ["HOME"] = resolved_home
-    os.environ["USERPROFILE"] = resolved_home
-    os.environ["HOMEDRIVE"] = resolved_home_path.drive
-    os.environ["HOMEPATH"] = str(resolved_home_path).replace(resolved_home_path.drive, "", 1)
-    os.environ.setdefault("PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK", "True")
-    return cache_root
+        progress.set_postfix(
+            field=row.get("field_name"),
+            bucket=output_rows[-1]["review_bucket"],
+        )
 
-
-def imread_unicode(path: Path) -> np.ndarray | None:
-    try:
-        data = np.fromfile(str(path), dtype=np.uint8)
-        if data.size == 0:
-            return None
-        return cv2.imdecode(data, cv2.IMREAD_COLOR)
-    except OSError:
-        return None
-
-
-def get_crop_path(row: dict, project_root: Path) -> Path:
-    crop_key = row.get("crop_path") or row.get("path")
-    if not crop_key:
-        raise KeyError("Manifest row is missing both `crop_path` and `path`.")
-    return resolve_path(crop_key, project_root)
-
-
-def remove_if_exists(path: Path) -> None:
-    try:
-        if path.exists():
-            path.unlink()
-    except OSError:
-        pass
-
-
-def build_record(row: dict, project_root: Path, viet_adapter: VietOCRAdapter, paddle_adapter: PaddleOCRAdapter) -> dict:
-    field_name = row.get("field_name") or FIELD_NAME_MAP.get(row.get("class", ""), row.get("class"))
-    crop_path = get_crop_path(row, project_root)
-    image = imread_unicode(crop_path)
-    if image is None:
-        raise FileNotFoundError(f"Cannot read crop image: {crop_path}")
-
-    viet_result = viet_adapter.predict(image, field_name)
-    paddle_result = paddle_adapter.predict(image, field_name)
-    best_result = ensemble_predictions(field_name, viet_result, paddle_result)
-    best_bucket = review_bucket(best_result.confidence)
-
-    return {
-        "crop_path": to_portable_path(crop_path, project_root),
-        "field_name": field_name,
-        "class": row.get("class"),
-        "split": row.get("split"),
-        "source_image": row.get("source_image"),
-        "ann_id": row.get("ann_id"),
-        "text_vietocr": viet_result.text,
-        "conf_vietocr": viet_result.confidence,
-        "text_paddle": paddle_result.text,
-        "conf_paddle": paddle_result.confidence,
-        "best_text": best_result.text,
-        "best_conf": best_result.confidence,
-        "best_source": best_result.source,
-        "best_normalized_text": best_result.normalized_text,
-        "review_bucket": best_bucket,
-        "needs_review": best_result.needs_review,
-        "ground_truth_text": row.get("ground_truth_text", ""),
-        "candidates": {
-            "vietocr": asdict(viet_result),
-            "paddleocr": asdict(paddle_result),
-        },
-    }
+    return output_rows
 
 
 def main() -> None:
-    configure_utf8_stdio()
-    parser = argparse.ArgumentParser(description="Generate pseudo-labels from cropped field images.")
-    parser.add_argument("--manifest", default="data/interim/cropped_fields/manifest.jsonl")
-    parser.add_argument("--output-dir", default="data/processed/ocr")
-    parser.add_argument("--project-root", default=".")
-    parser.add_argument("--vietocr-config", default="vgg_transformer")
-    parser.add_argument("--paddle-lang", default="vi")
-    parser.add_argument("--splits", nargs="*", default=None)
-    parser.add_argument("--max-samples", type=int, default=None)
-    parser.add_argument(
-        "--write-buckets",
-        action="store_true",
-        help="Also export accept/review/reject JSONL files. By default only pseudo_labels.jsonl is written.",
-    )
-    args = parser.parse_args()
+    args = parse_args()
+    configure_logging(args.log_level)
 
+    started_at = perf_counter()
     project_root = Path(args.project_root).resolve()
     manifest_path = resolve_path(args.manifest, project_root)
-    output_dir = resolve_path(args.output_dir, project_root)
+    output_path = resolve_path(args.output, project_root)
 
-    rows = read_jsonl(manifest_path)
-    rows = [row for row in rows if (row.get("field_name") or FIELD_NAME_MAP.get(row.get("class", ""), "")) in TARGET_FIELDS]
-    if args.splits:
-        split_set = set(args.splits)
-        rows = [row for row in rows if row.get("split") in split_set]
-    if args.max_samples:
-        rows = rows[: args.max_samples]
-    if not rows:
-        raise ValueError("No target OCR rows found in manifest.")
+    manifest_rows = read_jsonl(manifest_path)
+    if args.fields:
+        field_filter = {field.strip() for field in args.fields}
+        manifest_rows = [row for row in manifest_rows if row.get("field_name") in field_filter]
+    if args.limit is not None:
+        manifest_rows = manifest_rows[: args.limit]
+    if not manifest_rows:
+        raise ValueError("Manifest does not contain any crop rows to process.")
 
-    missing_paths: list[str] = []
-    for row in rows[: min(len(rows), 100)]:
-        crop_path = get_crop_path(row, project_root)
-        if not crop_path.exists():
-            missing_paths.append(str(crop_path))
-    if missing_paths:
-        sample = "\n".join(missing_paths[:5])
-        raise FileNotFoundError(
-            "Manifest exists but crop image files are missing.\n"
-            "Re-run scripts/crop_fields.py to materialize crop images, then run pseudo-label generation again.\n"
-            f"Example missing files:\n{sample}"
-        )
+    LOGGER.info("Initializing OCR recognizers")
+    vietocr = VietOCRRecognizer(config_name=args.vietocr_config, device=args.vietocr_device)
+    paddleocr = PaddleOCRRecognizer(language=args.paddle_lang, device=args.paddle_device)
+    rows = run_batch(
+        manifest_rows,
+        project_root=project_root,
+        vietocr=vietocr,
+        paddleocr=paddleocr,
+        use_hybrid_long_text=args.use_hybrid_long_text,
+    )
 
-    disabled_proxy_keys = disable_broken_proxy_env()
-    if disabled_proxy_keys:
-        print(f"Disabled broken proxy env vars for OCR downloads: {', '.join(disabled_proxy_keys)}")
-    configure_local_model_cache(project_root)
-    print("Using project-local model cache for OCR downloads.")
-
-    viet_adapter = VietOCRAdapter(config_name=args.vietocr_config)
-    paddle_adapter = PaddleOCRAdapter(language=args.paddle_lang)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    total_rows = len(rows)
-    print(f"Processing {total_rows} crop(s) for pseudo-label generation...")
-
-    counts = {"accept": 0, "review": 0, "reject": 0}
-    pseudo_path = output_dir / "pseudo_labels.jsonl"
-    accept_path = output_dir / "accept.jsonl"
-    review_path = output_dir / "review.jsonl"
-    reject_path = output_dir / "reject.jsonl"
-
-    if not args.write_buckets:
-        remove_if_exists(accept_path)
-        remove_if_exists(review_path)
-        remove_if_exists(reject_path)
-
-    with ExitStack() as stack:
-        pseudo_handle = stack.enter_context(pseudo_path.open("w", encoding="utf-8"))
-        bucket_handles: dict[str, object] = {}
-        if args.write_buckets:
-            bucket_handles = {
-                "accept": stack.enter_context(accept_path.open("w", encoding="utf-8")),
-                "review": stack.enter_context(review_path.open("w", encoding="utf-8")),
-                "reject": stack.enter_context(reject_path.open("w", encoding="utf-8")),
-            }
-
-        for index, row in enumerate(
-            tqdm(rows, total=total_rows, desc="Pseudo-labels", unit="crop"),
-            start=1,
-        ):
-            record = build_record(row, project_root, viet_adapter, paddle_adapter)
-            write_jsonl_line(pseudo_handle, record)
-
-            bucket = record["review_bucket"]
-            counts[bucket] += 1
-            if args.write_buckets:
-                write_jsonl_line(bucket_handles[bucket], record)
-
-            if index % 50 == 0:
-                pseudo_handle.flush()
-                for handle in bucket_handles.values():
-                    handle.flush()
-
-    print(f"Generated {total_rows} pseudo-label rows in {output_dir}")
-    print(f"Buckets summary: accept={counts['accept']}, review={counts['review']}, reject={counts['reject']}")
-    if args.write_buckets:
-        print("Wrote: pseudo_labels.jsonl + accept/review/reject JSONL files")
-    else:
-        print("Wrote: pseudo_labels.jsonl")
+    write_jsonl(output_path, rows)
+    LOGGER.info("Pseudo-labels written to %s", output_path)
+    LOGGER.info("Generated %d rows in %.2fs", len(rows), perf_counter() - started_at)
 
 
 if __name__ == "__main__":

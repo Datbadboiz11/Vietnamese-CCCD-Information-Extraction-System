@@ -113,3 +113,30 @@ Chi tiết thiết kế từng module xem tại [PLAN.md](PLAN.md).
     month = { jul }
 }
 ```
+
+## OCR Batch Commands
+
+Quick smoke test on 20 crops:
+
+```powershell
+.\.venv\Scripts\python.exe scripts\crop_fields.py --splits val --output-dir data\interim\cropped_fields_smoke --manifest-output data\interim\cropped_fields_smoke\manifest_20.jsonl --limit-crops 20
+.\.venv\Scripts\python.exe scripts\generate_pseudo_labels.py --manifest data\interim\cropped_fields_smoke\manifest_20.jsonl --output outputs\ocr_smoke\pseudo_labels_20.jsonl --limit 20
+```
+
+Full batch OCR:
+
+```powershell
+.\.venv\Scripts\python.exe scripts\crop_fields.py --splits train val test --output-dir data\interim\cropped_fields --manifest-output data\interim\cropped_fields\manifest.jsonl
+.\.venv\Scripts\python.exe scripts\generate_pseudo_labels.py --manifest data\interim\cropped_fields\manifest.jsonl --output data\processed\ocr\pseudo_labels.jsonl
+```
+
+Evaluation:
+
+```powershell
+.\.venv\Scripts\python.exe scripts\evaluate_ocr.py --gt data\processed\ocr\reviewed.jsonl --pred data\processed\ocr\pseudo_labels.jsonl --output-dir outputs\ocr_eval
+```
+
+Colab GPU guide:
+
+- [COLAB_OCR_GPU.md](COLAB_OCR_GPU.md)
+- [scripts/colab_batch_ocr_gpu.ipynb](scripts/colab_batch_ocr_gpu.ipynb)

@@ -17,3 +17,37 @@ __pycache__/
 # OS
 .DS_Store
 Thumbs.db
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Env
+.venv/
+venv/
+env/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Build / cache
+.cache/
+.pytest_cache/
+.mypy_cache/
+
+# Data / outputs
+data/interim/
+outputs/
+logs/
+tmp/
+temp/
+
+# Models
+*.pt
+*.pth
+*.ckpt
+
+# OS
+.DS_Store
+Thumbs.db

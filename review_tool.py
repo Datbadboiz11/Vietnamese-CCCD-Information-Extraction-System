@@ -52,7 +52,7 @@ def compute_stats(records):
     for r in records:
         b = r.get("review_bucket", "unknown")
         buckets[b] = buckets.get(b, 0) + 1
-        c = r.get("class", "unknown")
+        c = r.get("class") or r.get("field_name", "unknown")
         fields[c] = fields.get(c, 0) + 1
     return {"total": total, "done": done, "remaining": total - done,
             "buckets": buckets, "fields": fields}
@@ -395,9 +395,8 @@ function render() {
   let candidatesHtml = '';
   const cands = rec.candidates || {};
   for (const [src, c] of Object.entries(cands)) {
-    const isBest = src === rec.best_source || (rec.best_source === 'vietocr' && src === 'vietocr')
-                   || (rec.best_source === 'confidence_tiebreak' && src === 'vietocr');
     const txt = c.text || '';
+    const isBest = rec.best_source === 'agree' ? txt === bestText : src === rec.best_source;
     candidatesHtml += `
     <div class="candidate">
       <div class="candidate-header">
@@ -681,8 +680,8 @@ class Handler(BaseHTTPRequestHandler):
 
 def main():
     parser = argparse.ArgumentParser(description="OCR Pseudo-Label Review Tool")
-    parser.add_argument("--input",  default="data/processed/ocr/reviewed.jsonl",
-                        help="Path tới file reviewed.jsonl")
+    parser.add_argument("--input",  default="outputs/ocr_smoke/pseudo_labels_20_after.jsonl",
+                                                help="Path tới file reviewed.jsonl")
     parser.add_argument("--output", default="",
                         help="Path lưu (mặc định: ghi đè input)")
     parser.add_argument("--export", default="data/processed/ocr/reviewed_final.jsonl",
@@ -699,6 +698,42 @@ def main():
         return
 
     records = load_records(input_path)
+    # Chuyển đổi format pseudo_labels.jsonl sang format tool cần
+    for idx, r in enumerate(records):
+        paddle_text = r.get("text_paddle")
+        if paddle_text is None:
+            paddle_text = r.get("text_paddleocr", "")
+        paddle_conf = r.get("conf_paddle")
+        if paddle_conf is None:
+            paddle_conf = r.get("conf_paddleocr", 0.0)
+
+        candidates = r.get("candidates") or {}
+        if r.get("text_vietocr") is not None and "vietocr" not in candidates:
+            candidates["vietocr"] = {
+                "text": r.get("text_vietocr", ""),
+                "confidence": r.get("conf_vietocr", 0.0),
+            }
+        if paddle_text is not None and "paddleocr" not in candidates:
+            candidates["paddleocr"] = {
+                "text": paddle_text,
+                "confidence": paddle_conf or 0.0,
+            }
+        r["candidates"] = candidates
+
+        if "best_source" not in r or not r["best_source"]:
+            viet_text = str(r.get("text_vietocr", "") or "")
+            paddle_text = str(paddle_text or "")
+            best_text = str(r.get("best_text", "") or "")
+            if best_text and best_text == viet_text and best_text == paddle_text:
+                r["best_source"] = "agree"
+            elif best_text and best_text == paddle_text:
+                r["best_source"] = "paddleocr"
+            else:
+                r["best_source"] = "vietocr"
+        if "field_name" not in r:
+            r["field_name"] = r.get("class", "")
+        if "ann_id" not in r:
+            r["ann_id"] = idx
     print(f"[INFO] Loaded {len(records)} records từ {input_path}")
 
     stats = compute_stats(records)
