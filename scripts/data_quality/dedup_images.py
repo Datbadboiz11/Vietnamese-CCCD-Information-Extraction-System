@@ -35,15 +35,15 @@ HASH_SIZE = 8
 
 def compute_phash(image_path: Path, hash_size: int = HASH_SIZE) -> np.ndarray | None:
     """Perceptual hash: DCT trên ảnh grayscale 32x32, lấy 8x8 top-left."""
-    img_size = hash_size * 4
-    img = Image.open(image_path).convert("L").resize(
+    img_size = hash_size * 4 #chuẩn hóa ảnh về 32x32
+    img = Image.open(image_path).convert("L").resize( 
         (img_size, img_size), Image.LANCZOS
-    )
-    pixels = np.array(img, dtype=float)
-    dct_coeffs = dct(dct(pixels, axis=0), axis=1)
-    dct_low = dct_coeffs[:hash_size, :hash_size]
-    median = np.median(dct_low)
-    return (dct_low > median).flatten()
+    ) #chuyển về grayscale và resize về 32x32
+    pixels = np.array(img, dtype=float) #chuyển ảnh thành mảng numpy
+    dct_coeffs = dct(dct(pixels, axis=0), axis=1) #tính DCT 2D
+    dct_low = dct_coeffs[:hash_size, :hash_size] #lấy 8x8 block đầu tiên bên trái
+    median = np.median(dct_low) #tính median của block 8x8
+    return (dct_low > median).flatten() #
 
 class UnionFind:
     def __init__(self, n: int):
@@ -53,12 +53,12 @@ class UnionFind:
         while self.parent[x] != x:
             self.parent[x] = self.parent[self.parent[x]]
             x = self.parent[x]
-        return x
+        return x #tìm root của x với path compression
 
     def union(self, x: int, y: int):
         px, py = self.find(x), self.find(y)
         if px != py:
-            self.parent[px] = py
+            self.parent[px] = py #nối root của x vào root của y
 
     def clusters(self) -> list[list[int]]:
         groups: dict[int, list[int]] = defaultdict(list)
