@@ -708,10 +708,10 @@ def main():
                     "text": r.get("text_vietocr", ""),
                     "confidence": r.get("conf_vietocr", 0.0),
                 }
-            if r.get("text_paddleocr") is not None:
-                r["candidates"]["paddleocr"] = {
-                    "text": r.get("text_paddleocr", ""),
-                    "confidence": r.get("conf_paddleocr", 0.0),
+            if r.get("text_easyocr") is not None:
+                r["candidates"]["easyocr"] = {
+                    "text": r.get("text_easyocr", ""),
+                    "confidence": r.get("conf_easyocr", 0.0),
                 }
         if "best_source" not in r:
             r["best_source"] = "vietocr"

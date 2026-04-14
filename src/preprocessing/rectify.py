@@ -67,10 +67,14 @@ def _try_contour(image: np.ndarray, bbox: tuple) -> Optional[np.ndarray]:
     if not contours:
         return None
 
+    roi_area = (rx2 - rx1) * (ry2 - ry1)
     for cnt in sorted(contours, key=cv2.contourArea, reverse=True)[:5]:
         peri   = cv2.arcLength(cnt, True)
         approx = cv2.approxPolyDP(cnt, 0.02 * peri, True)
         if len(approx) == 4:
+            # Bỏ qua nếu diện tích quá nhỏ so với ROI (tìm nhầm contour bên trong thẻ)
+            if cv2.contourArea(approx) < 0.5 * roi_area:
+                continue
             corners = approx.reshape(4, 2).astype(np.float32)
             corners[:, 0] += rx1
             corners[:, 1] += ry1
@@ -80,7 +84,7 @@ def _try_contour(image: np.ndarray, bbox: tuple) -> Optional[np.ndarray]:
 
 
 def _bbox_crop(image: np.ndarray, bbox: tuple) -> tuple:
-    x1, y1, x2, y2 = bbox
+    x1, y1, x2, y2 = (int(v) for v in bbox)
     h, w = image.shape[:2]
     pad_x = int((x2 - x1) * 0.05)
     pad_y = int((y2 - y1) * 0.05)
