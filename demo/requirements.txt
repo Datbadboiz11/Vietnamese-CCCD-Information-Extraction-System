@@ -1,0 +1,19 @@
+# Demo & Evaluation Dependencies
+# Install with: pip install -r demo/requirements.txt
+
+# Core
+streamlit>=1.28.0
+streamlit-option-menu>=0.3.0
+
+# Image processing
+Pillow>=10.0.0
+opencv-python>=4.8.0
+
+# ML & OCR
+ultralytics>=8.0.0  # YOLOv8/YOLOv11
+vietocr>=0.3.0
+
+# Utilities
+numpy>=1.24.0
+requests>=2.31.0
+tqdm>=4.66.0
