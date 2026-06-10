@@ -311,6 +311,40 @@ def _build_non_label_block_candidates(lines: list[LineSegment], field_name: str)
     return candidates
 
 
+def _build_single_segment_candidates(lines: list[LineSegment], field_name: str) -> list[TextRegionCandidate]:
+    candidates: list[TextRegionCandidate] = []
+    for line in lines:
+        candidate = _make_candidate(
+            kind="single-segment",
+            raw_text=line.text,
+            field_name=field_name,
+            box_xyxy=line.box_xyxy,
+            segments=[line.source],
+        )
+        if candidate is not None:
+            candidates.append(candidate)
+    return candidates
+
+
+def _build_adjacent_pair_candidates(lines: list[LineSegment], field_name: str) -> list[TextRegionCandidate]:
+    candidates: list[TextRegionCandidate] = []
+    for index in range(len(lines) - 1):
+        left = lines[index]
+        right = lines[index + 1]
+        if not _boxes_can_merge(left.box_xyxy, right.box_xyxy):
+            continue
+        candidate = _make_candidate(
+            kind="adjacent-merge",
+            raw_text=f"{left.text} {right.text}",
+            field_name=field_name,
+            box_xyxy=_union_boxes([left.box_xyxy, right.box_xyxy]),
+            segments=[left.source, right.source],
+        )
+        if candidate is not None:
+            candidates.append(candidate)
+    return candidates
+
+
 def _dedupe_candidates(candidates: list[TextRegionCandidate]) -> list[TextRegionCandidate]:
     best_by_text: dict[str, TextRegionCandidate] = {}
     for candidate in candidates:
@@ -327,18 +361,20 @@ def _has_label_heavy_raw_text(paddle_result: OCRResult, field_name: str) -> bool
 
 def select_best_text_candidate(field_name: str, paddle_result: OCRResult) -> TextRegionCandidate | None:
     canonical_field = canonicalize_field_name(field_name) or field_name
-    if canonical_field not in TEXT_LINE_PICK_FIELDS:
-        return None
 
     lines = _ordered_segments(paddle_result.segments)
     if not lines:
         return None
 
-    candidates = _dedupe_candidates(
-        _build_same_line_candidates(lines, canonical_field)
-        + _build_below_label_candidates(lines, canonical_field)
-        + _build_non_label_block_candidates(lines, canonical_field)
-    )
+    candidate_pool = _build_single_segment_candidates(lines, canonical_field)
+    candidate_pool += _build_adjacent_pair_candidates(lines, canonical_field)
+    candidate_pool += _build_same_line_candidates(lines, canonical_field)
+
+    if canonical_field in TEXT_LINE_PICK_FIELDS:
+        candidate_pool += _build_below_label_candidates(lines, canonical_field)
+        candidate_pool += _build_non_label_block_candidates(lines, canonical_field)
+
+    candidates = _dedupe_candidates(candidate_pool)
     if not candidates:
         return None
 
@@ -354,6 +390,8 @@ def select_best_text_candidate(field_name: str, paddle_result: OCRResult) -> Tex
     if raw_label_heavy and best_candidate.score >= base_confidence - 0.02:
         return best_candidate
     if best_candidate.score >= base_confidence + 0.03:
+        return best_candidate
+    if canonical_field not in TEXT_LINE_PICK_FIELDS and best_candidate.score >= base_confidence + 0.01:
         return best_candidate
     if len(best_candidate.text) > len(base_text) + 6 and best_candidate.score >= base_confidence - 0.02:
         return best_candidate
@@ -446,8 +484,6 @@ def run_hybrid_field_ocr(
 ) -> tuple[OCRResult, OCRResult]:
     canonical_field = canonicalize_field_name(field_name) or field_name
     paddle_result = _safe_predict(paddle_adapter, image, field_name, "paddleocr")
-    if canonical_field not in TEXT_LINE_PICK_FIELDS:
-        return _safe_predict(viet_adapter, image, field_name, "vietocr"), paddle_result
 
     refined_paddle, candidate = build_refined_paddle_result(canonical_field, paddle_result)
     whole_viet = _safe_predict(viet_adapter, image, field_name, "vietocr")

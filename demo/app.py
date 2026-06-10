@@ -11,6 +11,7 @@ Hoặc từ terminal:
 
 import json
 import tempfile
+from datetime import datetime
 from pathlib import Path
 
 import streamlit as st
@@ -32,9 +33,8 @@ if project_root not in sys.path:
 # Local imports
 try:
     from src.pipeline import CCCDPipeline
-    from src.evaluation import OCREvaluator
-    from src.parsing import ConfidenceRouter
     from src.parsing.validators import CCCDParser
+    from src.ocr.cropping import clamp_bbox, crop_image_xyxy
 except ImportError as e:
     st.error(f"Cannot import src modules: {e}\n\nMake sure you're running from project root.")
     st.stop()
@@ -116,6 +116,114 @@ def _display_extraction_table(parsed_info, ocr_results=None):
     html_table += '</table>'
     
     st.markdown(html_table, unsafe_allow_html=True)
+
+
+def _write_image(path: Path, image: np.ndarray | None) -> bool:
+    if image is None or image.size == 0:
+        return False
+    path.parent.mkdir(parents=True, exist_ok=True)
+    ok, encoded = cv2.imencode(path.suffix or ".jpg", image)
+    if not ok:
+        return False
+    encoded.tofile(str(path))
+    return True
+
+
+def _sanitize_debug(obj):
+    """Make debug dicts JSON-serializable (drop numpy arrays, etc.)."""
+    if isinstance(obj, dict):
+        out = {}
+        for k, v in obj.items():
+            if k == "crop_shape":
+                out[k] = [int(x) for x in v]
+            elif isinstance(v, (np.ndarray,)):
+                out[k] = f"<array shape={v.shape}>"
+            else:
+                out[k] = _sanitize_debug(v)
+        return out
+    if isinstance(obj, (list, tuple)):
+        return [_sanitize_debug(x) for x in obj]
+    if isinstance(obj, (np.integer,)):
+        return int(obj)
+    if isinstance(obj, (np.floating,)):
+        return float(obj)
+    return obj
+
+
+def _save_debug_bundle(image_path: str, result, save_root: Path) -> Path:
+    source_name = Path(image_path).stem or "image"
+    run_dir = save_root / f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{source_name}"
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    original_image = cv2.imread(image_path)
+    _write_image(run_dir / "original.jpg", original_image)
+    _write_image(run_dir / "rectified.jpg", result.rectified_image)
+
+    crop_source = result.rectified_image if result.rectified_image is not None else original_image
+    field_debug: list[dict] = []
+    long_text_fields = {"origin", "address"}
+
+    if crop_source is not None:
+        for det in result.field_detections:
+            cls_name = str(det.get("class_name", ""))
+            if cls_name not in long_text_fields:
+                continue
+            bbox = det.get("bbox_xyxy")
+            if not bbox:
+                continue
+            clamped = clamp_bbox(bbox, crop_source.shape)
+            crop = crop_image_xyxy(crop_source, clamped)
+            crop_path = run_dir / f"crop_{cls_name}.jpg"
+            _write_image(crop_path, crop)
+            raw_text, raw_conf = result.ocr_results.get(cls_name, ("", 0.0))
+            field_debug.append(
+                {
+                    "class_name": cls_name,
+                    "bbox_xyxy": [float(v) for v in clamped.tolist()],
+                    "det_confidence": float(det.get("confidence", 0.0)),
+                    "raw_text": raw_text,
+                    "raw_confidence": float(raw_conf),
+                }
+            )
+
+    parsed = result.parsed_info
+    debug_payload = {
+        "source_image": image_path,
+        "saved_at": datetime.now().isoformat(timespec="seconds"),
+        "card_detected": bool(result.card_detected),
+        "card_bbox": result.card_bbox,
+        "card_confidence": float(result.card_confidence),
+        "rectification_method": result.rectification_method,
+        "image_quality_score": float(result.image_quality_score),
+        "quality_metrics": result.quality_metrics,
+        "enhancement_tier": int(result.enhancement_tier),
+        "enhancement_tier_label": result.enhancement_tier_label,
+        "enhancement_actions": result.enhancement_actions,
+        "processing_steps": result.processing_steps,
+        "warnings": result.warnings,
+        "errors": result.errors,
+        "ocr_results": {
+            cls: {"text": text, "confidence": float(conf)}
+            for cls, (text, conf) in result.ocr_results.items()
+        },
+        "parsed_info": parsed.to_dict() if parsed else None,
+        "field_results": {
+            name: {
+                "raw_text": fr.raw_text,
+                "value": fr.value,
+                "confidence": float(fr.confidence),
+                "is_valid": bool(fr.is_valid),
+                "auto_corrected": bool(fr.auto_corrected),
+                "warning": fr.warning,
+                "review_reason": fr.review_reason,
+            }
+            for name, fr in (parsed.field_results.items() if parsed else [])
+        },
+        "long_text_fields": field_debug,
+        "field_debug": {k: _sanitize_debug(v) for k, v in (result.field_debug or {}).items()},
+    }
+    (run_dir / "debug.json").write_text(json.dumps(debug_payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    return run_dir
 
 
 @st.cache_data
@@ -220,6 +328,7 @@ def load_pipeline(card_path, field_path, device):
             field_detector_path=field_path,
             device=device,
             use_ensemble=use_ensemble,
+            use_tta=False,
         )
         return pipeline, None, use_ensemble
     except Exception as e:
@@ -235,8 +344,19 @@ if error:
 
 if _using_ensemble:
     st.sidebar.success("OCR Engine: VietOCR + PaddleOCR ensemble")
+elif _paddle_available():
+    st.sidebar.info("OCR Engine: VietOCR + PaddleOCR (multiline)")
 else:
-    st.sidebar.info("OCR Engine: VietOCR  (cài paddleocr để dùng ensemble)")
+    st.sidebar.info("OCR Engine: VietOCR only (cài paddleocr để cải thiện)")
+
+use_cache = st.sidebar.checkbox("Use pre-computed cache", value=False,
+                                help="Override live OCR with cached results from pseudo_labels.jsonl")
+save_debug_bundle = st.sidebar.checkbox(
+    "Save debug bundle",
+    value=True,
+    help="Save original image, rectified image, origin/address crops, OCR and parsed output for each run.",
+)
+debug_output_dir = Path(project_root) / "outputs" / "demo_debug"
 
 # Load JSONL lookup cache (pre-computed ensemble results for dataset images)
 _jsonl_cache_path = os.path.join(project_root, "pseudo_labels.jsonl")
@@ -290,7 +410,7 @@ if st.button("Extract Information", use_container_width=True, type="primary"):
 
                 # Override OCR results with pre-computed cache if available
                 uploaded_name = uploaded_file.name if uploaded_file else ""
-                if uploaded_name and uploaded_name in ocr_cache:
+                if use_cache and uploaded_name and uploaded_name in ocr_cache:
                     cached_fields = ocr_cache[uploaded_name]
                     result.ocr_results.update(cached_fields)
                     # Re-parse with cached values
@@ -305,6 +425,9 @@ if st.button("Extract Information", use_container_width=True, type="primary"):
                     st.session_state.cache_hit = False
 
                 st.session_state.results = result
+                st.session_state.debug_bundle_dir = None
+                if save_debug_bundle:
+                    st.session_state.debug_bundle_dir = str(_save_debug_bundle(image_path, result, debug_output_dir))
                 st.success("Processing complete!")
 
             except Exception as e:
@@ -321,6 +444,8 @@ if st.session_state.results:
         st.info("Results from cache (ensemble VietOCR + PaddleOCR from dataset)")
     else:
         st.info("Live OCR (VietOCR)")
+    if st.session_state.get("debug_bundle_dir"):
+        st.caption(f"Debug bundle: {st.session_state.debug_bundle_dir}")
 
     col_img, col_table = st.columns(2)
 

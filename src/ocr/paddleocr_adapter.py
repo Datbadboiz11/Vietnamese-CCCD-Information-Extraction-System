@@ -13,6 +13,15 @@ from src.ocr.types import OCRResult, OCRSegment
 from src.ocr.utils import TEXT_LINE_PICK_FIELDS, calibrate_ocr_confidence, canonicalize_field_name, cleanup_ocr_text, collapse_whitespace, empty_ocr_result, normalize_text_for_field
 
 LOGGER = logging.getLogger(__name__)
+_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+_LONG_TEXT_REC_MODEL_DIR = os.path.join(
+    _REPO_ROOT,
+    "model",
+    "ocr",
+    "ppocrv5_cccd_address_origin",
+    "latin_ppocrv5_cccd",
+    "inference",
+)
 
 
 def _configure_headless_matplotlib_backend() -> None:
@@ -23,6 +32,10 @@ def _configure_headless_matplotlib_backend() -> None:
 
 def _infer_paddle_device() -> str:
     try:
+        try:
+            import torch  # noqa: F401
+        except Exception:
+            pass
         import paddle
 
         if paddle.device.is_compiled_with_cuda():
@@ -138,6 +151,17 @@ def _prepare_image(image: np.ndarray, field_name: str | None = None) -> tuple[np
     if prepared.ndim == 2:
         prepared = cv2.cvtColor(prepared, cv2.COLOR_GRAY2BGR)
 
+    _is_place_field = field_name in {
+        "place_of_origin", "place_of_residence", "origin", "address",
+    }
+
+    if _is_place_field:
+        lab = cv2.cvtColor(prepared, cv2.COLOR_BGR2LAB)
+        l_ch, a_ch, b_ch = cv2.split(lab)
+        clahe = cv2.createCLAHE(clipLimit=1.5, tileGridSize=(4, 4))
+        l_ch = clahe.apply(l_ch)
+        prepared = cv2.cvtColor(cv2.merge([l_ch, a_ch, b_ch]), cv2.COLOR_LAB2BGR)
+
     height, width = prepared.shape[:2]
     pad_x = max(6, int(round(width * 0.08)))
     pad_y = max(6, int(round(height * 0.12)))
@@ -145,6 +169,10 @@ def _prepare_image(image: np.ndarray, field_name: str | None = None) -> tuple[np
 
     min_height = 96 if field_name in {"id", "id_number", "birth", "date_of_birth"} else 128
     scale = max(1.0, min_height / max(1, prepared.shape[0]))
+    if scale >= 1.5 and _is_place_field:
+        from src.preprocessing.super_resolution import super_resolve
+        prepared = super_resolve(prepared, min_height=min_height)
+        scale = max(1.0, min_height / max(1, prepared.shape[0]))
     if scale > 1.0:
         prepared = cv2.resize(prepared, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
     return prepared, scale, pad_x, pad_y
@@ -225,11 +253,16 @@ class PaddleOCRRecognizer:
         self.show_log = show_log
         self.device = _resolve_paddle_device(device)
         self._client: Any | None = None
+        self._long_text_client: Any | None = None
+        self._long_text_recognition_client: Any | None = None
 
-    def _get_client(self) -> Any:
-        if self._client is not None:
-            return self._client
+    @staticmethod
+    def _has_custom_long_text_model() -> bool:
+        return os.path.isdir(_LONG_TEXT_REC_MODEL_DIR) and os.path.isfile(
+            os.path.join(_LONG_TEXT_REC_MODEL_DIR, "inference.pdiparams")
+        )
 
+    def _build_client(self, *, rec_model_dir: str | None = None) -> Any:
         _configure_headless_matplotlib_backend()
         try:
             from paddleocr import PaddleOCR
@@ -267,17 +300,87 @@ class PaddleOCRRecognizer:
             if signature is not None and key in signature.parameters:
                 kwargs[key] = value
 
+        if rec_model_dir:
+            for key, value in {
+                "text_recognition_model_dir": rec_model_dir,
+                "rec_model_dir": rec_model_dir,
+            }.items():
+                if signature is None or key in signature.parameters:
+                    kwargs[key] = value
+            if signature is None or "text_recognition_model_name" in signature.parameters:
+                kwargs["text_recognition_model_name"] = "latin_PP-OCRv5_mobile_rec"
+
         try:
-            self._client = PaddleOCR(**kwargs)
+            return PaddleOCR(**kwargs)
         except ValueError as exc:
             if "Unknown argument: show_log" not in str(exc):
                 raise
             kwargs.pop("show_log", None)
-            self._client = PaddleOCR(**kwargs)
+            return PaddleOCR(**kwargs)
+
+    def _build_text_recognition_client(self, *, model_dir: str) -> Any:
+        _configure_headless_matplotlib_backend()
+        try:
+            # PaddleX may touch torch-backed utilities on Windows. Loading torch
+            # first avoids a late shm.dll failure during TextRecognition init.
+            import torch  # noqa: F401
+        except Exception:
+            pass
+        try:
+            from paddleocr import TextRecognition
+        except ImportError as exc:
+            raise RuntimeError(
+                "PaddleOCR TextRecognition is unavailable. Install paddleocr>=3 before running recognition."
+            ) from exc
+
+        return TextRecognition(
+            model_name="latin_PP-OCRv5_mobile_rec",
+            model_dir=model_dir,
+            device=self.device,
+            enable_hpi=False,
+        )
+
+    def _get_client(self) -> Any:
+        if self._client is not None:
+            return self._client
+
+        self._client = self._build_client()
         return self._client
 
-    def _predict_candidates(self, image: np.ndarray) -> list[tuple[str, float, np.ndarray | None, int]]:
-        client = self._get_client()
+    def _get_long_text_client(self) -> Any:
+        if self._long_text_client is not None:
+            return self._long_text_client
+        if not self._has_custom_long_text_model():
+            self._long_text_client = self._get_client()
+            return self._long_text_client
+        LOGGER.info("Loading fine-tuned PP-OCRv5 recognizer from %s", _LONG_TEXT_REC_MODEL_DIR)
+        self._long_text_client = self._build_client(rec_model_dir=_LONG_TEXT_REC_MODEL_DIR)
+        return self._long_text_client
+
+    def _get_long_text_recognition_client(self) -> Any:
+        if self._long_text_recognition_client is not None:
+            return self._long_text_recognition_client
+        if not self._has_custom_long_text_model():
+            return None
+        LOGGER.info("Loading fine-tuned PP-OCRv5 TextRecognition from %s", _LONG_TEXT_REC_MODEL_DIR)
+        self._long_text_recognition_client = self._build_text_recognition_client(model_dir=_LONG_TEXT_REC_MODEL_DIR)
+        return self._long_text_recognition_client
+
+    def _predict_long_text_recognition_candidates(
+        self,
+        image: np.ndarray,
+    ) -> list[tuple[str, float, np.ndarray | None, int]]:
+        client = self._get_long_text_recognition_client()
+        if client is None:
+            return []
+        return _flatten_candidates(client.predict(image))
+
+    def _predict_candidates(self, image: np.ndarray, field_name: str | None = None) -> list[tuple[str, float, np.ndarray | None, int]]:
+        canonical_field = canonicalize_field_name(field_name)
+        if canonical_field in {"place_of_origin", "place_of_residence"}:
+            client = self._get_long_text_client()
+        else:
+            client = self._get_client()
         if hasattr(client, "predict"):
             kwargs: dict[str, Any] = {}
             signature = inspect.signature(client.predict)
@@ -300,8 +403,14 @@ class PaddleOCRRecognizer:
             return empty_ocr_result("paddleocr")
 
         try:
-            prepared, scale, pad_x, pad_y = _prepare_image(image, field_name)
-            candidates = self._predict_candidates(prepared)
+            canonical_field = canonicalize_field_name(field_name)
+            if canonical_field in {"place_of_origin", "place_of_residence"} and self._has_custom_long_text_model():
+                prepared = image
+                scale, pad_x, pad_y = 1.0, 0, 0
+                candidates = self._predict_long_text_recognition_candidates(prepared)
+            else:
+                prepared, scale, pad_x, pad_y = _prepare_image(image, field_name)
+                candidates = self._predict_candidates(prepared, field_name=field_name)
         except Exception as exc:
             LOGGER.warning("PaddleOCR inference failed: %s", exc)
             result = empty_ocr_result("paddleocr")

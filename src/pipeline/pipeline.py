@@ -21,10 +21,14 @@ import cv2
 import numpy as np
 
 from src.ocr.cropping import crop_image_xyxy, clamp_bbox, prepare_card_for_ocr
-from src.ocr.ensemble import ensemble_recognize
+from src.ocr.ensemble import ensemble_recognize, select_best_ocr_result
+from src.ocr.hybrid_line_pick import run_hybrid_field_ocr
+from src.ocr.multiline_ocr import recognize_multiline_field
+from src.ocr.paddleocr_adapter import PaddleOCRRecognizer
+from src.ocr.text_detection import PaddleTextDetector, is_multi_line_field
 from src.ocr.vietocr_adapter import VietOCRRecognizer
 from src.parsing.validators import CCCDParser, ParsedInfo
-from src.preprocessing.enhance import apply_clahe, compute_image_quality_score
+from src.preprocessing.enhance import apply_clahe, compute_image_quality_score, enhance_field_crop
 from src.preprocessing.orientation import auto_orient_for_ocr
 from src.preprocessing.rectify import rectify_from_bbox
 
@@ -55,6 +59,45 @@ _CLASS_TO_FIELD = {
 }
 
 
+def _ocr_sanity_score(cls_name: str, text: str) -> float:
+    """Return a penalty multiplier (0.0–1.0) based on whether the OCR text
+    is plausible for the detected field class.  A low score means the field
+    detector likely misclassified the region."""
+    if not text or not text.strip():
+        return 0.0
+
+    digit_ratio = sum(c.isdigit() for c in text) / max(len(text), 1)
+
+    if cls_name == "id":
+        digits = "".join(c for c in text if c.isdigit())
+        if len(digits) >= 11:
+            return 1.0
+        if len(digits) >= 9:
+            return 0.7
+        return 0.1
+
+    if cls_name == "birth":
+        import re
+        if re.search(r"\d{1,2}[/\-\.]\d{1,2}[/\-\.]\d{2,4}", text):
+            return 1.0
+        digits = "".join(c for c in text if c.isdigit())
+        if len(digits) >= 6:
+            return 0.6
+        return 0.1
+
+    if cls_name == "name":
+        if digit_ratio > 0.5:
+            return 0.1
+        return 1.0
+
+    if cls_name in ("origin", "address"):
+        if digit_ratio > 0.7 and len(text) > 8:
+            return 0.2
+        return 1.0
+
+    return 1.0
+
+
 # ---------------------------------------------------------------------------
 # PipelineResult
 # ---------------------------------------------------------------------------
@@ -74,6 +117,12 @@ class PipelineResult:
 
     # Image quality
     image_quality_score: float = 0.0
+    quality_metrics: dict[str, float] = field(default_factory=dict)
+
+    # Enhancement diagnostics
+    enhancement_tier: int = 0
+    enhancement_tier_label: str = "none"
+    enhancement_actions: list[str] = field(default_factory=list)
 
     # Field detection
     field_detections: list[dict[str, Any]] = field(default_factory=list)
@@ -81,6 +130,7 @@ class PipelineResult:
 
     # OCR results: {class_name: (text, confidence)}
     ocr_results: dict[str, tuple[str, float]] = field(default_factory=dict)
+    field_debug: dict[str, dict[str, Any]] = field(default_factory=dict)
 
     # Parsing
     parsed_info: ParsedInfo | None = None
@@ -100,8 +150,13 @@ class PipelineResult:
             "card_confidence": self.card_confidence,
             "rectification_method": self.rectification_method,
             "image_quality_score": self.image_quality_score,
+            "quality_metrics": self.quality_metrics,
+            "enhancement_tier": self.enhancement_tier,
+            "enhancement_tier_label": self.enhancement_tier_label,
+            "enhancement_actions": self.enhancement_actions,
             "field_detections": self.field_detections,
             "ocr_results": {k: {"text": v[0], "confidence": v[1]} for k, v in self.ocr_results.items()},
+            "field_debug": self.field_debug,
             "warnings": self.warnings,
             "errors": self.errors,
         }
@@ -135,6 +190,7 @@ class CCCDPipeline:
         field_conf_threshold: float = 0.3,
         use_ensemble: bool = False,  # True = dùng cả VietOCR + PaddleOCR
         use_tta: bool = False,
+        use_text_region_refinement: bool = True,
     ) -> None:
         self.card_detector_path = card_detector_path
         self.field_detector_path = field_detector_path
@@ -143,10 +199,14 @@ class CCCDPipeline:
         self.field_conf_threshold = field_conf_threshold
         self.use_ensemble = use_ensemble
         self.use_tta = use_tta
+        self.use_text_region_refinement = use_text_region_refinement
+        self.place_bbox_pad_pct = 0.06
 
         self._card_detector: Any = None
         self._field_detector: Any = None
         self._vietocr: VietOCRRecognizer | None = None
+        self._vietocr_address: VietOCRRecognizer | None = None
+        self._paddleocr: PaddleOCRRecognizer | None = None
         self._parser = CCCDParser()
 
     # ── lazy loaders ──────────────────────────────────────────────────────
@@ -165,6 +225,21 @@ class CCCDPipeline:
         if self._vietocr is None:
             self._vietocr = VietOCRRecognizer(device=self.device)
         return self._vietocr
+
+    def _get_vietocr_address(self) -> VietOCRRecognizer:
+        if self._vietocr_address is None:
+            self._vietocr_address = VietOCRRecognizer.address_v1(device=self.device)
+        return self._vietocr_address
+
+    def _get_vietocr_for_field(self, field_name: str | None) -> VietOCRRecognizer:
+        if field_name == "place_of_residence":
+            return self._get_vietocr_address()
+        return self._get_vietocr()
+
+    def _get_paddleocr(self) -> PaddleOCRRecognizer:
+        if self._paddleocr is None:
+            self._paddleocr = PaddleOCRRecognizer(device=self.device)
+        return self._paddleocr
 
     @staticmethod
     def _load_yolo(model_path: str) -> Any:
@@ -252,32 +327,31 @@ class CCCDPipeline:
     # ── enhancement ───────────────────────────────────────────────────────
 
     def _enhance(self, card_image: np.ndarray, result: PipelineResult) -> np.ndarray:
-        """CLAHE enhancement + quality score.
-
-        CLAHE chỉ áp dụng khi chất lượng ảnh thấp (quality < 0.55).
-        Ảnh chất lượng cao (CCCD chip có hoa văn nền phức tạp) nếu tăng
-        tương phản sẽ làm nhiễu nền nổi rõ hơn, gây mất dấu khi OCR.
-        """
+        """Adaptive tiered enhancement based on quality metrics."""
         try:
-            quality = compute_image_quality_score(card_image)
-            result.image_quality_score = quality.get("image_quality_score", 0.0)
-            # Ngưỡng: chỉ enhance khi ảnh thiếu sáng / mờ / thiếu tương phản
-            if result.image_quality_score < 0.55:
-                enhanced = apply_clahe(card_image)
-                result._add_step(
-                    "enhancement", "success",
-                    f"clahe_applied, quality={result.image_quality_score:.2f}"
-                )
-                return enhanced
-            else:
-                result._add_step(
-                    "enhancement", "skipped",
-                    f"quality={result.image_quality_score:.2f} (>= 0.55, skip CLAHE)"
-                )
-                return card_image
+            from src.preprocessing.enhance import adaptive_enhance
+            enh = adaptive_enhance(card_image)
+            result.image_quality_score = enh.quality_metrics.get("image_quality_score", 0.0)
+            result.quality_metrics = enh.quality_metrics
+            result.enhancement_tier = enh.tier
+            result.enhancement_tier_label = enh.tier_label
+            result.enhancement_actions = enh.actions_applied
+            result._add_step(
+                "enhancement", "success",
+                f"tier={enh.tier} ({enh.tier_label}), "
+                f"quality={result.image_quality_score:.2f}, "
+                f"actions={enh.actions_applied}"
+            )
+            return enh.image
         except Exception as exc:
             result.warnings.append(f"Enhancement failed: {exc}")
             result._add_step("enhancement", "warning", str(exc))
+            try:
+                quality = compute_image_quality_score(card_image)
+                result.image_quality_score = quality.get("image_quality_score", 0.0)
+                result.quality_metrics = quality
+            except Exception:
+                pass
             return card_image
 
     # ── field detection ───────────────────────────────────────────────────
@@ -325,6 +399,44 @@ class CCCDPipeline:
             )
         return detections
 
+    # ── bbox trimming ────────────────────────────────────────────────────
+
+    @staticmethod
+    def _trim_place_bbox(
+        bbox: np.ndarray, cls_name: str, card_height: int,
+    ) -> np.ndarray:
+        """Light trim of address/origin bbox — only remove obvious bleeding.
+
+        Label text filtering is handled downstream by multiline_ocr, so we
+        only do a minimal geometric trim here to avoid cutting actual content.
+        """
+        x1, y1, x2, y2 = [float(v) for v in bbox]
+        field_h = y2 - y1
+        line_h = card_height / 18.0
+
+        min_h = line_h * 2.0
+        if y2 - y1 < min_h:
+            mid = (float(bbox[1]) + float(bbox[3])) / 2
+            y1 = mid - min_h / 2
+            y2 = mid + min_h / 2
+
+        return np.array([x1, y1, x2, y2], dtype=np.float32)
+
+    def _expand_place_bbox(
+        self, bbox: np.ndarray, image_shape: tuple[int, ...],
+    ) -> np.ndarray:
+        """Expand address/origin bbox by a percentage to capture clipped text."""
+        x1, y1, x2, y2 = [float(v) for v in bbox]
+        w = x2 - x1
+        h = y2 - y1
+        pad_x = w * self.place_bbox_pad_pct
+        pad_y = h * self.place_bbox_pad_pct
+        expanded = np.array(
+            [x1 - pad_x, y1 - pad_y, x2 + pad_x, y2 + pad_y],
+            dtype=np.float32,
+        )
+        return clamp_bbox(expanded, image_shape)
+
     # ── OCR ───────────────────────────────────────────────────────────────
 
     def _run_ocr(
@@ -334,8 +446,10 @@ class CCCDPipeline:
         result: PipelineResult,
     ) -> None:
         """Crop từng field và chạy OCR, lưu vào result.ocr_results."""
-        vietocr = self._get_vietocr()
-        h, w = card_image.shape[:2]
+        h, _ = card_image.shape[:2]
+
+        detector: PaddleTextDetector | None = None
+        paddle_recognizer: PaddleOCRRecognizer | None = None
 
         for det in detections:
             cls_name: str = det["class_name"]
@@ -344,6 +458,12 @@ class CCCDPipeline:
 
             # Clamp bbox vào kích thước card
             clamped = clamp_bbox(bbox, card_image.shape)
+
+            if cls_name in ("address", "origin"):
+                clamped = self._trim_place_bbox(clamped, cls_name, h)
+                clamped = clamp_bbox(clamped, card_image.shape)
+                clamped = self._expand_place_bbox(clamped, card_image.shape)
+
             try:
                 crop = crop_image_xyxy(card_image, clamped)
             except Exception as exc:
@@ -354,12 +474,68 @@ class CCCDPipeline:
                 result.warnings.append(f"Empty crop for {cls_name}")
                 continue
 
+            if cls_name in ("address", "origin"):
+                crop = enhance_field_crop(crop)
+
             canonical_field = _CLASS_TO_FIELD.get(cls_name, cls_name)
+            vietocr = self._get_vietocr_for_field(canonical_field)
+            debug_info: dict[str, Any] = {
+                "class_name": cls_name,
+                "canonical_field": canonical_field,
+                "detector_confidence": float(det_conf),
+                "crop_bbox_xyxy": [round(float(v), 2) for v in clamped.tolist()],
+                "crop_shape": list(crop.shape),
+            }
 
             try:
-                if self.use_ensemble:
-                    from src.ocr.paddleocr_adapter import PaddleOCRRecognizer
-                    paddle = PaddleOCRRecognizer()
+                if is_multi_line_field(canonical_field):
+                    if detector is None:
+                        detector = PaddleTextDetector()
+                    if paddle_recognizer is None:
+                        try:
+                            paddle_recognizer = self._get_paddleocr()
+                        except Exception:
+                            pass
+                    ocr_out = recognize_multiline_field(
+                        crop, canonical_field, vietocr,
+                        detector=detector,
+                        paddleocr_recognizer=paddle_recognizer,
+                    )
+                    text = ocr_out.text or ""
+                    conf = float(ocr_out.score)
+                    debug_info["ocr_strategy"] = "multiline_field"
+                    debug_info["engine"] = ocr_out.engine
+                    debug_info["raw"] = ocr_out.raw or {}
+                elif self.use_text_region_refinement:
+                    paddle = self._get_paddleocr()
+                    refined_viet, refined_paddle = run_hybrid_field_ocr(
+                        image=crop,
+                        field_name=canonical_field,
+                        paddle_adapter=paddle,
+                        viet_adapter=vietocr,
+                    )
+                    chosen = select_best_ocr_result(
+                        canonical_field,
+                        refined_viet,
+                        refined_paddle,
+                    )
+                    text = chosen.text or ""
+                    conf = float(chosen.score)
+                    debug_info["ocr_strategy"] = "hybrid_text_region_refinement"
+                    debug_info["engine"] = chosen.engine
+                    debug_info["raw"] = chosen.raw or {}
+                    debug_info["candidates"] = {
+                        "vietocr": {
+                            "text": refined_viet.text,
+                            "confidence": float(refined_viet.score),
+                        },
+                        "paddleocr": {
+                            "text": refined_paddle.text,
+                            "confidence": float(refined_paddle.score),
+                        },
+                    }
+                elif self.use_ensemble:
+                    paddle = self._get_paddleocr()
                     ocr_out = ensemble_recognize(
                         field_name=canonical_field,
                         image=crop,
@@ -368,25 +544,195 @@ class CCCDPipeline:
                     )
                     text = ocr_out.text or ""
                     conf = float(ocr_out.score)
+                    debug_info["ocr_strategy"] = "ensemble"
+                    debug_info["engine"] = ocr_out.engine
+                    debug_info["raw"] = ocr_out.raw or {}
                 else:
                     ocr_out = vietocr.recognize(crop, field_name=canonical_field)
                     text = ocr_out.text or ""
                     conf = float(ocr_out.score)
+                    debug_info["ocr_strategy"] = "vietocr_direct"
+                    debug_info["engine"] = ocr_out.engine
+                    debug_info["raw"] = ocr_out.raw or {}
             except Exception as exc:
                 result.warnings.append(f"OCR failed for {cls_name}: {exc}")
                 text = ""
                 conf = 0.0
+                debug_info["ocr_strategy"] = "failed"
+                debug_info["error"] = str(exc)
+
+            # Penalize confidence when OCR text doesn't match expected field type
+            sanity = _ocr_sanity_score(cls_name, text)
+            debug_info["sanity_score"] = float(sanity)
+            if sanity < 1.0:
+                conf *= sanity
+                if sanity <= 0.1:
+                    result.warnings.append(
+                        f"{cls_name}: OCR text doesn't match field type (sanity={sanity:.1f})"
+                    )
+            debug_info["final_text"] = text
+            debug_info["final_confidence"] = float(conf)
 
             # Lưu kết quả — giữ kết quả có confidence cao hơn nếu class trùng
             existing = result.ocr_results.get(cls_name)
             if existing is None or conf > existing[1]:
                 result.ocr_results[cls_name] = (text, conf)
+                result.field_debug[cls_name] = debug_info
 
         result._add_step(
             "ocr",
             "success",
             f"{len(result.ocr_results)} fields recognized"
         )
+
+    # ── conditional TTA retry ────────────────────────────────────────────
+
+    def _retry_with_tta(
+        self,
+        card_image: np.ndarray,
+        detections: list[dict[str, Any]],
+        result: PipelineResult,
+        confidence_threshold: float = 0.5,
+    ) -> None:
+        """Retry low-confidence fields with TTA variants.
+
+        Triggered when image_quality_score < 0.5 (all fields) or
+        individual field confidence < threshold.
+        """
+        from src.ocr.tta import generate_ocr_tta_variants
+
+        force_all = result.image_quality_score < 0.5
+        h, w = card_image.shape[:2]
+
+        detector: PaddleTextDetector | None = None
+        paddle_recognizer = None
+        tta_retried: list[str] = []
+
+        for det in detections:
+            cls_name: str = det["class_name"]
+            canonical_field = _CLASS_TO_FIELD.get(cls_name, cls_name)
+            vietocr = self._get_vietocr_for_field(canonical_field)
+
+            existing = result.ocr_results.get(cls_name)
+            if existing is None:
+                continue
+            existing_text, existing_conf = existing
+
+            if not force_all and existing_conf >= confidence_threshold:
+                continue
+
+            bbox = det["bbox_xyxy"]
+            clamped = clamp_bbox(bbox, card_image.shape)
+            if cls_name in ("address", "origin"):
+                clamped = self._trim_place_bbox(clamped, cls_name, h)
+                clamped = clamp_bbox(clamped, card_image.shape)
+
+            try:
+                crop = crop_image_xyxy(card_image, clamped)
+            except Exception:
+                continue
+            if crop is None or crop.size == 0:
+                continue
+
+            variants = generate_ocr_tta_variants(crop, canonical_field, enable_tta=True)
+            best_text = existing_text
+            best_conf = existing_conf
+
+            for variant in variants:
+                if variant.name == "base":
+                    continue
+                try:
+                    if is_multi_line_field(canonical_field):
+                        if detector is None:
+                            detector = PaddleTextDetector()
+                        if paddle_recognizer is None:
+                            try:
+                                from src.ocr.paddleocr_adapter import PaddleOCRRecognizer
+                                paddle_recognizer = PaddleOCRRecognizer()
+                            except Exception:
+                                pass
+                        ocr_out = recognize_multiline_field(
+                            variant.image, canonical_field, vietocr,
+                            detector=detector,
+                            paddleocr_recognizer=paddle_recognizer,
+                        )
+                        text = ocr_out.text or ""
+                        conf = float(ocr_out.score)
+                    elif self.use_ensemble:
+                        from src.ocr.paddleocr_adapter import PaddleOCRRecognizer
+                        paddle = PaddleOCRRecognizer()
+                        ocr_out = ensemble_recognize(
+                            field_name=canonical_field,
+                            image=variant.image,
+                            vietocr_recognizer=vietocr,
+                            paddleocr_recognizer=paddle,
+                        )
+                        text = ocr_out.text or ""
+                        conf = float(ocr_out.score)
+                    else:
+                        ocr_out = vietocr.recognize(variant.image, field_name=canonical_field)
+                        text = ocr_out.text or ""
+                        conf = float(ocr_out.score)
+
+                    sanity = _ocr_sanity_score(cls_name, text)
+                    conf *= sanity
+
+                    if conf > best_conf:
+                        best_text = text
+                        best_conf = conf
+                except Exception as exc:
+                    LOGGER.debug("TTA variant %s failed for %s: %s", variant.name, cls_name, exc)
+                    continue
+
+            if best_conf > existing_conf:
+                result.ocr_results[cls_name] = (best_text, best_conf)
+                tta_retried.append(cls_name)
+
+        if tta_retried:
+            result._add_step(
+                "tta_retry", "success",
+                f"Improved {len(tta_retried)} fields: {tta_retried}"
+            )
+        else:
+            result._add_step("tta_retry", "skipped", "No fields improved by TTA")
+
+    # ── template-based ID fallback ──────────────────────────────────────
+
+    def _try_template_id(
+        self, card_image: np.ndarray, result: PipelineResult,
+    ) -> None:
+        """Fallback: crop the known ID region on a standard CCCD and re-OCR.
+
+        On a front-side CCCD (856×540 after rectification), the ID number
+        sits at roughly y=38-50%, x=38-85% of the card.
+        """
+        import re as _re
+
+        existing = result.ocr_results.get("id")
+        if existing:
+            digits = "".join(c for c in existing[0] if c.isdigit())
+            if len(digits) >= 12:
+                return
+
+        h, w = card_image.shape[:2]
+        # Template region for the 12-digit ID on a standard CCCD front
+        x1, y1 = int(w * 0.38), int(h * 0.36)
+        x2, y2 = int(w * 0.88), int(h * 0.52)
+        crop = card_image[y1:y2, x1:x2]
+        if crop.size == 0:
+            return
+
+        vietocr = self._get_vietocr()
+        ocr_out = vietocr.recognize(crop, field_name="id_number")
+        text = ocr_out.text or ""
+        digits = "".join(c for c in text if c.isdigit())
+
+        if len(digits) >= 12:
+            conf = float(ocr_out.score)
+            existing_conf = existing[1] if existing else 0.0
+            if conf > existing_conf:
+                result.ocr_results["id"] = (text, conf)
+                result.warnings.append("id: used template crop fallback")
 
     # ── parsing ───────────────────────────────────────────────────────────
 
@@ -452,6 +798,13 @@ class CCCDPipeline:
 
         # 6. OCR
         self._run_ocr(card_image, detections, result)
+
+        # 6a. Conditional TTA retry for low-confidence fields
+        if self.use_tta:
+            self._retry_with_tta(card_image, detections, result)
+
+        # 6b. Template fallback for ID if detection missed it
+        self._try_template_id(card_image, result)
 
         # 7. Parsing & Validation
         self._parse(result)

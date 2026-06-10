@@ -2,16 +2,16 @@
   "model": "yolo11s.pt",
   "val": {
     "map50": 0.995,
-    "map50_95": 0.8488,
-    "precision": 0.9995,
+    "map50_95": 0.8195,
+    "precision": 0.9997,
     "recall": 0.9972,
     "pass": true
   },
   "test": {
-    "map50": 0.9935,
-    "map50_95": 0.8415,
-    "precision": 0.9993,
-    "recall": 0.991
+    "map50": 0.9913,
+    "map50_95": 0.807,
+    "precision": 0.9995,
+    "recall": 0.9913
   },
   "config": {
     "epochs": 100,

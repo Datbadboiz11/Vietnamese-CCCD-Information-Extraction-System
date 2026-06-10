@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 from typing import Any
 
 import cv2
@@ -106,6 +107,28 @@ def compute_image_quality_score(image: np.ndarray) -> dict[str, float]:
     }
 
 
+def adjust_gamma(image: np.ndarray, gamma: float = 1.0) -> np.ndarray:
+    """Apply gamma correction. gamma < 1.0 brightens, gamma > 1.0 darkens."""
+    if image is None or image.size == 0:
+        raise ValueError("Input image is empty.")
+    inv_gamma = 1.0 / max(gamma, 1e-6)
+    table = np.array(
+        [((i / 255.0) ** inv_gamma) * 255 for i in range(256)],
+        dtype=np.uint8,
+    )
+    return cv2.LUT(image, table)
+
+
+def apply_sharpening(image: np.ndarray) -> np.ndarray:
+    """Light unsharp-mask sharpening for blurry card images."""
+    if image is None or image.size == 0:
+        raise ValueError("Input image is empty.")
+    kernel = np.array([[0, -1, 0],
+                       [-1, 5, -1],
+                       [0, -1, 0]], dtype=np.float32)
+    return cv2.filter2D(image, -1, kernel)
+
+
 def enhance_card_image(
     image: np.ndarray,
     clip_limit: float = 2.0,
@@ -123,9 +146,121 @@ def enhance_card_image(
     return denoised_image, metrics
 
 
+@dataclass
+class EnhancementResult:
+    """Result of adaptive enhancement with diagnostics."""
+
+    image: np.ndarray
+    tier: int
+    tier_label: str
+    quality_metrics: dict[str, float]
+    actions_applied: list[str] = field(default_factory=list)
+
+
+def adaptive_enhance(image: np.ndarray) -> EnhancementResult:
+    """Tiered enhancement based on granular quality metrics.
+
+    Tier 1 (≥0.65): skip — high quality
+    Tier 2 (0.45–0.65): light CLAHE
+    Tier 3 (0.30–0.45): CLAHE + denoise
+    Tier 4 (<0.30): aggressive CLAHE + denoise + gamma brighten
+    """
+    if image is None or image.size == 0:
+        raise ValueError("Input image is empty.")
+
+    quality = compute_image_quality_score(image)
+    score = quality["image_quality_score"]
+    sharpness = quality["sharpness_score"]
+
+    actions: list[str] = []
+    result = image.copy()
+
+    if score >= 0.65:
+        tier, label = 1, "skip"
+    elif score >= 0.45:
+        tier, label = 2, "light_clahe"
+        result = apply_clahe(result, clip_limit=2.0)
+        actions.append("clahe")
+    elif score >= 0.30:
+        tier, label = 3, "clahe_denoise"
+        result = apply_clahe(result, clip_limit=2.0)
+        actions.append("clahe")
+        result = denoise_image(result, strength=10)
+        actions.append("denoise")
+    else:
+        tier, label = 4, "aggressive"
+        result = apply_clahe(result, clip_limit=3.0)
+        actions.append("aggressive_clahe")
+        result = denoise_image(result, strength=12)
+        actions.append("denoise")
+        result = adjust_gamma(result, gamma=0.8)
+        actions.append("gamma_brighten")
+
+    if sharpness < 0.3:
+        result = apply_sharpening(result)
+        actions.append("sharpen")
+
+    gray = _to_gray(result)
+    raw_brightness = float(np.mean(gray))
+
+    if raw_brightness < 80 and "gamma_brighten" not in actions:
+        result = adjust_gamma(result, gamma=0.75)
+        actions.append("gamma_brighten")
+    elif raw_brightness > 220:
+        result = adjust_gamma(result, gamma=1.4)
+        actions.append("gamma_darken")
+
+    return EnhancementResult(
+        image=result,
+        tier=tier,
+        tier_label=label,
+        quality_metrics=quality,
+        actions_applied=actions,
+    )
+
+
+def enhance_field_crop(image: np.ndarray) -> np.ndarray:
+    """Quality-adaptive enhancement for a single field crop before OCR.
+
+    Computes quality on the crop itself (independent of card-level metrics)
+    and applies targeted corrections: CLAHE for low contrast, bilateral
+    filter for noise, gamma for extreme brightness.
+    """
+    if image is None or image.size == 0:
+        return image
+
+    quality = compute_image_quality_score(image)
+    score = quality["image_quality_score"]
+    sharpness = quality["sharpness_score"]
+    result = image
+
+    if score >= 0.70:
+        return result
+
+    if quality["contrast_score"] < 0.45:
+        result = apply_clahe(result, clip_limit=1.5, tile_grid_size=(4, 4))
+
+    if sharpness < 0.20:
+        result = cv2.bilateralFilter(result, d=5, sigmaColor=50, sigmaSpace=50)
+
+    gray = _to_gray(result)
+    brightness = float(np.mean(gray))
+    if brightness < 90:
+        result = adjust_gamma(result, gamma=0.80)
+    elif brightness > 210:
+        result = adjust_gamma(result, gamma=1.3)
+
+    return result
+
+
 __all__ = [
+    "EnhancementResult",
+    "adaptive_enhance",
+    "adjust_gamma",
     "apply_clahe",
+    "apply_sharpening",
     "compute_image_quality_score",
     "denoise_image",
     "enhance_card_image",
+    "enhance_field_crop",
 ]
