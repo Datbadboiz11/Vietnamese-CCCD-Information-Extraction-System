@@ -7,7 +7,7 @@ import cv2
 from pathlib import Path
 
 # Add project root to path
-project_root = Path(__file__).parent
+project_root = Path(__file__).resolve().parent.parent
 if str(project_root) not in sys.path:
     sys.path.insert(0, str(project_root))
 
@@ -54,6 +54,18 @@ def debug_extraction(image_path: str):
     print("-" * 80)
     for class_name, (text, conf) in result.ocr_results.items():
         print(f"  {class_name:12} | Text: '{text:30}' | Confidence: {conf:.4f}")
+        debug_info = result.field_debug.get(class_name, {})
+        if debug_info:
+            strategy = debug_info.get("ocr_strategy", "")
+            engine = debug_info.get("engine", "")
+            bbox = debug_info.get("crop_bbox_xyxy", [])
+            print(f"    strategy={strategy} | engine={engine} | bbox={bbox}")
+            candidates = debug_info.get("candidates", {})
+            if candidates:
+                viet = candidates.get("vietocr", {})
+                paddle = candidates.get("paddleocr", {})
+                print(f"    vietocr='{viet.get('text', '')}' ({viet.get('confidence', 0.0):.4f})")
+                print(f"    paddle ='{paddle.get('text', '')}' ({paddle.get('confidence', 0.0):.4f})")
     
     # 4. Parsed Results
     print("\n✨ PARSED RESULTS:")

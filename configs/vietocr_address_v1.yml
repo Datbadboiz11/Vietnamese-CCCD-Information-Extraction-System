@@ -1,0 +1,69 @@
+aug:
+  image_aug: true
+  masked_language_model: true
+backbone: vgg19_bn
+cnn:
+  dropout: 0.5
+  hidden: 256
+  ks:
+  - - 2
+    - 2
+  - - 2
+    - 2
+  - - 2
+    - 1
+  - - 2
+    - 1
+  - - 1
+    - 1
+  ss:
+  - - 2
+    - 2
+  - - 2
+    - 2
+  - - 2
+    - 1
+  - - 2
+    - 1
+  - - 1
+    - 1
+dataloader:
+  num_workers: 2
+  pin_memory: true
+dataset:
+  data_root: /content/vietocr_address_v1
+  image_height: 48
+  image_max_width: 1024
+  image_min_width: 48
+  name: cccd_address_only_v1
+  train_annotation: train_annotation.txt
+  valid_annotation: val_annotation.txt
+device: cuda:0
+optimizer:
+  max_lr: 1.0e-05
+  pct_start: 0.05
+predictor:
+  beamsearch: false
+pretrain: https://vocr.vn/data/vietocr/vgg_transformer.pth
+quiet: true
+seq_modeling: transformer
+trainer:
+  batch_size: 8
+  checkpoint: /content/vietocr_address_v1/checkpoint_address_v1.ckpt
+  export: /content/vietocr_address_v1/vietocr_cccd_address_v1.pth
+  iters: 10000
+  log: /content/vietocr_address_v1/train_log_address_v1
+  metrics: 1000
+  print_every: 100
+  valid_every: 1000
+transformer:
+  d_model: 256
+  dim_feedforward: 2048
+  max_seq_length: 1024
+  nhead: 8
+  num_decoder_layers: 6
+  num_encoder_layers: 6
+  pos_dropout: 0.1
+  trans_dropout: 0.1
+vocab: 'aAàÀảẢãÃáÁạẠăĂằẰẳẲẵẴắẮặẶâÂầẦẩẨẫẪấẤậẬbBcCdDđĐeEèÈẻẺẽẼéÉẹẸêÊềỀểỂễỄếẾệỆfFgGhHiIìÌỉỈĩĨíÍịỊjJkKlLmMnNoOòÒỏỎõÕóÓọỌôÔồỒổỔỗỖốỐộỘơƠờỜởỞỡỠớỚợỢpPqQrRsStTuUùÙủỦũŨúÚụỤưƯừỪửỬữỮứỨựỰvVwWxXyYỳỲỷỶỹỸýÝỵỴzZ0123456789!"#$%&''()*+,-./:;<=>?@[\]^_`{|}~ '
+weights: ''

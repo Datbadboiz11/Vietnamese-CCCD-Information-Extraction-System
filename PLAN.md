@@ -1,10 +1,10 @@
-# Kế Hoạch Hệ Thống Information Extraction Từ CCCD Việt Nam — v3 (Final)
+# Kế Hoạch Hệ Thống Information Extraction Từ CCCD Việt Nam — v4 (Final)
 
 ## Tóm tắt
 
 Xây hệ thống `PoC học thuật` cho bài toán trích xuất thông tin từ `CCCD Việt Nam` theo hướng `OCR pipeline`:
 
-**Ảnh/Video gốc → Phát hiện thẻ → Hiệu chỉnh phối cảnh → Tăng cường ảnh → Xác định mặt thẻ → Định vị field → OCR → Chuẩn hóa & Validate → Đánh giá → Demo**
+**Ảnh/Video gốc → Phát hiện thẻ → Hiệu chỉnh phối cảnh → Tăng cường ảnh → Xác định mặt thẻ → Định vị field → Phát hiện dòng text → OCR → Chuẩn hóa & Validate → Đánh giá → Demo**
 
 Dựa trên dataset [cccd trên Roboflow Universe](https://universe.roboflow.com/interlock-ihpkg/cccd-lxlem) (CC BY 4.0, by Interlock), giai đoạn v1 tập trung vào `mặt trước CCCD`. Dataset có bbox cho `card`, `id`, `name`, `birth`, `origin`, `address`, `title`, nhưng chưa có transcript OCR và chưa có field cho mặt sau.
 
@@ -289,14 +289,54 @@ Output:
 - Mô hình: YOLOv8/YOLOv11, class `id`, `name`, `birth`, `origin`, `address`, `title`.
 - Resize: letterbox 640×640, giống card detector.
 
-#### Module 7: OCR
+#### Module 7: Text Line Detection *(mới)*
+
+- **Input:** field crop từ Module 6
+- **Output:** danh sách text-line crops, sắp xếp top-to-bottom
+- **Áp dụng cho:** chỉ các field multi-line — `place_of_origin` (1–2 dòng), `place_of_residence` (2 dòng)
+- **Bỏ qua cho:** `id_number`, `full_name`, `date_of_birth` (luôn 1 dòng → feed thẳng vào OCR)
+
+**Tại sao cần:**
+
+Địa chỉ và quê quán trên CCCD luôn có 2 dòng text (ví dụ: "Đắk Drông, Cư Jút," / "Đắk Nông"). VietOCR là model recognition **single-line** — khi nhận crop chứa nhiều dòng sẽ:
+- Hallucinate text tiếng Anh vô nghĩa ("TRANSMITTER", "Commonstribution", "MISSITES")
+- Lặp từ vô hạn ("THỊ THỊ THỊ THỊ THỊ THUẬN")
+- Đọc MRZ/barcode thay vì text ("036100000099", "0011960000000000009")
+
+Đây là nguyên nhân chính khiến address/origin có error rate rất cao trong pseudo-labels. Text detection tách từng dòng trước khi recognize giải quyết triệt để vấn đề này.
+
+**Phương pháp:**
+
+| Bước | Chi tiết |
+|---|---|
+| 1. Text detection | PaddleOCR det-only mode: phát hiện tất cả vùng text trong field crop |
+| 2. Sort | Sắp xếp theo tọa độ y (top→bottom), rồi x (left→right) cho cùng dòng |
+| 3. Filter MRZ/noise | Loại bỏ vùng: (a) chỉ chứa số liên tục ≥ 8 ký tự (MRZ contamination), (b) chiều cao < 10px, (c) nằm ngoài vùng text hợp lệ |
+| 4. Crop text lines | Cắt từng text line từ field crop, thêm padding 4–8px |
+| 5. Output | Danh sách `[(line_crop, bbox, line_index), ...]` cho Module 8 |
+
+**Fallback:** nếu PaddleOCR det không tìm được text line nào (crop quá nhỏ, quá mờ), fallback về horizontal projection profile (tách dòng bằng histogram pixel trắng) → nếu vẫn fail → feed nguyên crop vào OCR (giống hành vi cũ).
+
+**Lưu ý kỹ thuật:**
+- PaddleOCR det đã có sẵn trong dependency, không cần thêm model
+- Det-only mode: chỉ chạy text detection, không chạy recognition → nhanh
+- Field crop đã được rectify → text nằm ngang → detection dễ hơn ảnh tự nhiên
+
+#### Module 8: OCR
 
 *(Xem section "Chiến lược OCR" bên dưới để biết chi tiết đầy đủ)*
 
-- **Input:** crop của từng field
-- **Output:** `{text, confidence}`
+- **Input:**
+  - Với `id_number`, `full_name`, `date_of_birth`: crop nguyên field từ Module 6
+  - Với `place_of_origin`, `place_of_residence`: danh sách text-line crops từ Module 7
+- **Output:** `{text, confidence}` cho mỗi field
+- **Flow cho multi-line fields:**
+  1. Nhận danh sách text-line crops từ Module 7
+  2. Chạy VietOCR rec trên từng text line (VietOCR mạnh nhất khi input là single-line)
+  3. Nối kết quả: `"dòng 1, dòng 2"` (dấu phẩy + space làm separator)
+  4. Confidence = trung bình confidence các dòng, giảm nếu số dòng detect ≠ expected
 
-#### Module 8: Post-processing / Parsing
+#### Module 9: Post-processing / Parsing
 
 - **Mapping class → schema chuẩn:**
   - `id` → `id_number`
@@ -322,7 +362,7 @@ Output:
   - 0.5–0.8: accept + flag `needs_review` + ghi reason
   - < 0.5: thử OCR retry với ảnh enhance khác (sharpen, rotate ±2°). Nếu vẫn < 0.5 → `field_value = null`, flag review
 
-#### Module 9: Evaluation
+#### Module 10: Evaluation
 
 *(Xem section "Test Plan" để biết chi tiết metrics)*
 
@@ -338,7 +378,17 @@ Các field trên CCCD có bản chất rất khác nhau — dùng chung 1 model 
 |---|---|---|---|---|
 | **Số thuần** | `id_number` | 12 chữ số, font cố định | PaddleOCR (recognition only) + regex validate | Đơn giản, chỉ cần nhận dạng số |
 | **Ngày tháng** | `date_of_birth` | DD/MM/YYYY, chủ yếu số + `/` | PaddleOCR | Format cố định, dễ validate |
-| **Tiếng Việt** | `full_name`, `place_of_origin`, `place_of_residence` | Tiếng Việt có dấu, độ dài biến thiên, ký tự đặc biệt | VietOCR (Transformer-based) | Cần model hiểu dấu tiếng Việt, context ngữ nghĩa |
+| **Tên (single-line)** | `full_name` | Tiếng Việt có dấu, 1 dòng | VietOCR (Transformer-based) | Single-line → VietOCR đọc trực tiếp, mạnh về dấu tiếng Việt |
+| **Địa chỉ (multi-line)** | `place_of_origin`, `place_of_residence` | Tiếng Việt có dấu, **2 dòng**, chứa tên địa danh | **PaddleOCR det** (tách dòng) + **VietOCR rec** (đọc từng dòng) | Multi-line text bắt buộc phải tách dòng trước. PaddleOCR det robust, VietOCR rec chính xác dấu tiếng Việt — kết hợp ưu điểm cả hai |
+
+**Lưu ý quan trọng về multi-line fields:**
+
+Trước khi thêm Module 7 (Text Line Detection), address/origin được feed thẳng vào VietOCR → sai nghiêm trọng. Phân tích pseudo-labels cho thấy:
+- ~40% address crops bị VietOCR hallucinate text tiếng Anh hoặc số MRZ
+- ~30% origin crops bị đọc thành chuỗi số vô nghĩa (MRZ contamination)
+- Chỉ ~30% cho kết quả gần đúng (thường là khi text ngắn, vừa 1 dòng)
+
+Sau khi tách dòng bằng PaddleOCR det, VietOCR rec nhận input single-line → hoạt động đúng thiết kế → accuracy cải thiện đáng kể.
 
 ### Thứ tự ưu tiên fine-tune
 
@@ -392,16 +442,42 @@ Bước 5 (optional): Fine-tune
 
 ### OCR Ensemble Strategy
 
-Chạy song song VietOCR + PaddleOCR trên mỗi field crop, ensemble kết quả:
+Chiến lược ensemble khác nhau tùy loại field:
+
+**A. Single-line fields (`id_number`, `date_of_birth`, `full_name`):**
+
+Chạy song song VietOCR + PaddleOCR trên field crop, ensemble kết quả:
 
 ```
-Ensemble logic:
+Ensemble logic (single-line):
 1. Nếu 2 model cho cùng kết quả → accept (confidence = max của 2)
 2. Nếu khác nhau:
    a. Chọn kết quả pass validation rule (ví dụ: id_number đúng 12 số)
    b. Nếu cả 2 đều pass hoặc cả 2 đều fail → chọn confidence cao hơn
    c. Nếu confidence chênh < 0.1 → flag needs_review
 ```
+
+**B. Multi-line fields (`place_of_origin`, `place_of_residence`):**
+
+Dùng kiến trúc **det-rec tách biệt** thay vì ensemble 2 model song song:
+
+```
+Multi-line ensemble logic:
+1. PaddleOCR det → tìm text regions trong field crop
+2. Sort top-to-bottom, filter MRZ/noise
+3. Mỗi text line → chạy VietOCR rec (primary) + PaddleOCR rec (secondary)
+4. Per-line ensemble:
+   a. Nếu 2 rec cho cùng kết quả → accept
+   b. Nếu khác nhau → ưu tiên VietOCR (tốt hơn cho dấu tiếng Việt)
+      trừ khi VietOCR suspicious (hallucinate, toàn số, lặp từ) → chọn PaddleOCR
+5. Nối các dòng: "dòng 1, dòng 2"
+6. Confidence = min(det_confidence, mean(rec_confidences_per_line))
+```
+
+**Tại sao không dùng PaddleOCR end-to-end (det+rec) cho multi-line?**
+- PaddleOCR rec tiếng Việt kém hơn VietOCR (thiếu dấu, nhầm thanh điệu)
+- Nhưng PaddleOCR det rất tốt (robust, xử lý multi-line tự nhiên)
+- Kết hợp: PaddleOCR det (tìm dòng) + VietOCR rec (đọc dấu) = tối ưu
 
 ---
 
@@ -729,6 +805,8 @@ Ensemble: Weighted Boxes Fusion (WBF) hoặc NMS
 
 ### TTA cho OCR
 
+**Single-line fields (`id_number`, `full_name`, `date_of_birth`):**
+
 ```
 Input field crop
   ├─ Original → OCR → text_0, conf_0
@@ -737,6 +815,19 @@ Input field crop
   └─ Rotate ±2° → OCR → text_3, conf_3
 
 Ensemble: max confidence hoặc majority vote (≥ 2/4 giống nhau)
+```
+
+**Multi-line fields (`place_of_origin`, `place_of_residence`):**
+
+```
+Input field crop
+  ├─ Original → Text Det → lines → VietOCR rec per line → text_0, conf_0
+  ├─ Sharpen → Text Det → lines → VietOCR rec per line → text_1, conf_1
+  ├─ CLAHE enhance → Text Det → lines → VietOCR rec per line → text_2, conf_2
+  └─ Rotate ±2° → Text Det → lines → VietOCR rec per line → text_3, conf_3
+
+Ensemble: chọn variant có nhiều text lines hợp lệ nhất + confidence cao nhất
+Lưu ý: text det chạy lại trên mỗi variant vì enhance/rotate có thể giúp detect thêm dòng bị miss
 ```
 
 ### Khi nào bật TTA
@@ -821,11 +912,20 @@ Field Localization
   ├─ Detector tìm 0 field + rectification tốt → thử template crop toàn bộ
   └─ Detector tìm 0 field + rectification degraded → STOP, output partial result
 
+Text Line Detection (chỉ cho place_of_origin, place_of_residence)
+  ├─ PaddleOCR det tìm được ≥ 1 text line → sort + filter → tiếp tục OCR per line
+  ├─ PaddleOCR det trả về 0 line → fallback: horizontal projection profile
+  ├─ Projection profile tìm được lines → tiếp tục OCR per line
+  ├─ Projection profile cũng fail → feed nguyên field crop vào OCR (degraded mode) + flag review
+  └─ Det tìm được text line nhưng toàn số (MRZ) → loại bỏ, flag "mrz_contamination"
+
 OCR
+  ├─ Single-line fields: VietOCR + PaddleOCR ensemble (xem section Ensemble)
+  ├─ Multi-line fields: VietOCR rec per text line → nối kết quả
   ├─ Confidence ≥ 0.5 → accept (flag review nếu < 0.8)
-  ├─ Confidence < 0.5 → retry với enhance variants
+  ├─ Confidence < 0.5 → retry với enhance variants (bật TTA)
   ├─ Retry vẫn < 0.5 → field_value = null + flag review
-  └─ 2 model conflict → ensemble logic (xem section OCR)
+  └─ 2 model conflict → ensemble logic (xem section OCR Ensemble)
 ```
 
 **Nguyên tắc:** pipeline luôn cố gắng cho ra kết quả (dù partial) thay vì dừng hoàn toàn. Flag `review_reasons` sẽ ghi rõ bước nào bị degraded để người dùng biết mức độ tin cậy.
@@ -902,6 +1002,7 @@ Extraction ID Card/
 │  ├─ ocr/
 │  │  ├─ vietocr_adapter.py
 │  │  ├─ paddleocr_adapter.py
+│  │  ├─ text_detection.py              # PaddleOCR det-only + line sorting + MRZ filter
 │  │  └─ ensemble.py
 │  ├─ parsing/
 │  │  ├─ field_mapping.py
@@ -1007,11 +1108,12 @@ run_infer.py
   6. [TTA Check] → auto-trigger nếu quality/conf thấp
   7. [Side Classification] → rule-based
   8. [Field Localization] → field detector (primary) + template crop (fallback)
-  9. [OCR] → VietOCR + PaddleOCR ensemble
-  10. [Parsing] → validate (soft/hard rules) + confidence routing
-  11. [Error Recovery] → decision tree xử lý degraded mode
-  12. Xuất JSON + visualize intermediate steps
-  13. Log processing_time_ms, tta_applied, rectification_method
+  9. [Text Line Detection] → PaddleOCR det cho address/origin crops (skip cho id/name/birth)
+  10. [OCR] → single-line fields: VietOCR+PaddleOCR ensemble | multi-line fields: VietOCR rec per text line
+  11. [Parsing] → validate (soft/hard rules) + confidence routing + fuzzy match địa danh VN
+  12. [Error Recovery] → decision tree xử lý degraded mode
+  13. Xuất JSON + visualize intermediate steps
+  14. Log processing_time_ms, tta_applied, rectification_method, text_det_method
 ```
 
 ### 4. Luồng inference — Video
@@ -1091,16 +1193,17 @@ Deliverables:
 Phụ trách:
 - Module Rectification (perspective warp thẻ về 856×540)
 - Module Image Enhancement (CLAHE, denoising)
+- **Module Text Line Detection (PaddleOCR det cho multi-line fields)**
 - Pseudo-label workflow: chạy VietOCR + PaddleOCR, review transcript
-- Tích hợp OCR pipeline (ensemble VietOCR + PaddleOCR)
+- Tích hợp OCR pipeline (ensemble VietOCR + PaddleOCR, det-rec tách biệt cho address/origin)
 - Benchmark OCR (CER/WER per field)
 
 Deliverables:
 - `src/rectification/*`
 - `src/enhancement/*`
-- `src/ocr/*`
+- `src/ocr/*` (bao gồm `text_detection.py`)
 - `data/processed/ocr/` (field crops + reviewed transcripts)
-- bảng metric OCR cho báo cáo
+- bảng metric OCR cho báo cáo (đặc biệt so sánh trước/sau khi thêm text detection)
 
 ### Người 3: Parsing, Integration & Demo
 
@@ -1134,11 +1237,14 @@ Tuần 2:
             *** Checkpoint: detection đạt mAP@0.5 ≥ 0.85 (card), ≥ 0.75 (field) ***
   Người 2: Implement Rectification + Enhancement (dùng ảnh test thủ công)
             Crop fields từ bbox GT + chạy pseudo-label + bắt đầu review transcript
+            **Implement Text Line Detection (PaddleOCR det + line sorting + MRZ filter)**
   Người 3: Viết pipeline skeleton + evaluation framework + TTA module
 
 Tuần 3:
   Người 1: Hỗ trợ Người 2 review transcript + viết data quality report + ablation detection
-  Người 2: Tích hợp OCR ensemble + benchmark CER/WER + hoàn thành reviewed transcripts
+  Người 2: Tích hợp OCR ensemble + **tích hợp text det vào pipeline address/origin**
+            Benchmark CER/WER per field (đặc biệt so sánh address/origin trước/sau text det)
+            Hoàn thành reviewed transcripts
   Người 3: Nối pipeline end-to-end + test error recovery + video pipeline
 
 Tuần 4:
@@ -1165,18 +1271,19 @@ Tuần 4:
 ### Giai đoạn 2: OCR Dataset & Recognition (~tuần 2-3)
 
 - Crop field từ bbox GT.
-- Chạy pseudo-label (VietOCR + PaddleOCR song song).
-- Review transcript (ưu tiên: id_number → full_name → date_of_birth → còn lại).
-- Benchmark OCR pretrained.
-- Implement OCR ensemble.
+- **Implement Text Line Detection** (PaddleOCR det-only cho address/origin crops).
+- Chạy pseudo-label: single-line fields dùng VietOCR+PaddleOCR trực tiếp, **multi-line fields dùng text det → VietOCR rec per line**.
+- Review transcript (ưu tiên: id_number → full_name → date_of_birth → **place_of_origin → place_of_residence**).
+- Benchmark OCR pretrained — **đặc biệt so sánh address/origin trước/sau text detection**.
+- Implement OCR ensemble (2 strategy: single-line ensemble + multi-line det-rec).
 - Augmentation ablation study.
 - Fine-tune VietOCR nếu đủ thời gian.
 
 ### Giai đoạn 3: Integration & Robustness (~tuần 3)
 
-- Nối full pipeline: detection → rectify → orientation → enhance → field → OCR → parse.
-- Implement error recovery decision tree.
-- Implement TTA (detection + OCR).
+- Nối full pipeline: detection → rectify → orientation → enhance → field → **text det** → OCR → parse.
+- Implement error recovery decision tree (bao gồm text det fallback chain).
+- Implement TTA (detection + OCR, multi-line TTA cho address/origin).
 - Implement video pipeline (adaptive sampling → quality scoring → ensemble).
 - Test trên ảnh thực tế chụp từ điện thoại (ngoài test set).
 
@@ -1204,6 +1311,7 @@ Tuần 4:
 - Normalized Edit Distance
 - Pattern error: top-10 lỗi phổ biến per field
 - So sánh: VietOCR vs PaddleOCR vs ensemble
+- **So sánh: address/origin có/không text detection** (metric quan trọng nhất cho multi-line fields)
 - So sánh: có/không TTA
 
 ### End-to-end
@@ -1283,6 +1391,7 @@ CCCD chứa thông tin cá nhân nhạy cảm. Dù là PoC học thuật, cần 
 - **Tải raw images, KHÔNG dùng version stretch 640×640.**
 - OCR chưa train trực tiếp — dùng pseudo-label workflow.
 - `Field detector` là primary; `template crop` là fallback.
+- **Multi-line fields (address/origin) bắt buộc qua Text Line Detection trước OCR.** Single-line fields (id/name/birth) OCR trực tiếp trên field crop.
 - Detection phải đạt mAP gate trước khi chuyển sang OCR.
 - `mặt sau`, `mrz`, `issue_date`, `expiry_date`, `sex`, `nationality` chỉ làm khi có thêm data.
 - Pipeline V1 xử lý **single card per image/frame**.

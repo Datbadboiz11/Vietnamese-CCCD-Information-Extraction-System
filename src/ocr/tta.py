@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+import cv2
 import numpy as np
 
 
@@ -60,6 +61,35 @@ def _crop_by_ratios(
     return cropped if cropped.size != 0 else image
 
 
+def _sharpen_variant(image: np.ndarray) -> np.ndarray:
+    kernel = np.array([[0, -1, 0],
+                       [-1, 5, -1],
+                       [0, -1, 0]], dtype=np.float32)
+    return cv2.filter2D(image, -1, kernel)
+
+
+def _clahe_variant(image: np.ndarray) -> np.ndarray:
+    if image.ndim == 2:
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(4, 4))
+        return clahe.apply(image)
+    lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
+    l_ch, a_ch, b_ch = cv2.split(lab)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(4, 4))
+    l_ch = clahe.apply(l_ch)
+    return cv2.cvtColor(cv2.merge([l_ch, a_ch, b_ch]), cv2.COLOR_LAB2BGR)
+
+
+def _rotate_variant(image: np.ndarray, angle: float) -> np.ndarray:
+    h, w = image.shape[:2]
+    center = (w / 2.0, h / 2.0)
+    M = cv2.getRotationMatrix2D(center, angle, 1.0)
+    return cv2.warpAffine(
+        image, M, (w, h),
+        flags=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_REPLICATE,
+    )
+
+
 def generate_ocr_tta_variants(
     image: np.ndarray,
     field_name: str,
@@ -83,6 +113,12 @@ def generate_ocr_tta_variants(
     if field_name in TEXT_FIELDS and image.shape[1] >= image.shape[0] * 2.2:
         cropped = _crop_by_ratios(image, left_ratio=0.08, right_ratio=0.98)
         _append_variant(variants, seen_keys, "left_trim", cropped)
+
+    # Enhancement variants
+    _append_variant(variants, seen_keys, "sharpen", _sharpen_variant(image))
+    _append_variant(variants, seen_keys, "clahe", _clahe_variant(image))
+    _append_variant(variants, seen_keys, "rotate_pos2", _rotate_variant(image, 2.0))
+    _append_variant(variants, seen_keys, "rotate_neg2", _rotate_variant(image, -2.0))
 
     return variants
 

@@ -1,0 +1,60 @@
+vocab: 'aAàÀảẢãÃáÁạẠăĂằẰẳẲẵẴắẮặẶâÂầẦẩẨẫẪấẤậẬbBcCdDđĐeEèÈẻẺẽẼéÉẹẸêÊềỀểỂễỄếẾệỆfFgGhHiIìÌỉỈĩĨíÍịỊjJkKlLmMnNoOòÒỏỎõÕóÓọỌôÔồỒổỔỗỖốỐộỘơƠờỜởỞỡỠớỚợỢpPqQrRsStTuUùÙủỦũŨúÚụỤưƯừỪửỬữỮứỨựỰvVwWxXyYỳỲỷỶỹỸýÝỵỴzZ0123456789!"#$%&''()*+,-./:;<=>?@[\]^_`{|}~ '
+
+backbone: vgg19_bn
+cnn:
+  ss: [[2, 2], [2, 2], [2, 1], [2, 1], [1, 1]]
+  ks: [[2, 2], [2, 2], [2, 1], [2, 1], [1, 1]]
+  hidden: 256
+  dropout: 0.5
+
+transformer:
+  d_model: 256
+  nhead: 8
+  num_encoder_layers: 6
+  num_decoder_layers: 6
+  dim_feedforward: 2048
+  max_seq_length: 1024
+  pos_dropout: 0.1
+  trans_dropout: 0.1
+
+seq_modeling: transformer
+
+weights: ''
+pretrain: 'https://vocr.vn/data/vietocr/vgg_transformer.pth'
+
+device: cuda:0
+quiet: true
+
+dataset:
+  name: cccd_finetune
+  data_root: '.'
+  train_annotation: 'data/processed/ocr/finetune/train_annotation.txt'
+  valid_annotation: 'data/processed/ocr/finetune/val_annotation.txt'
+  image_height: 32
+  image_min_width: 32
+  image_max_width: 768
+
+dataloader:
+  num_workers: 0
+  pin_memory: true
+
+predictor:
+  beamsearch: false
+
+trainer:
+  batch_size: 8
+  iters: 25000
+  print_every: 100
+  valid_every: 2500
+  checkpoint: 'weights/vietocr_cccd_checkpoint.ckpt'
+  export: 'weights/vietocr_cccd.pth'
+  metrics: 2000
+  log: 'logs/vietocr_finetune'
+
+optimizer:
+  max_lr: 0.00005
+  pct_start: 0.1
+
+aug:
+  image_aug: true
+  masked_language_model: true

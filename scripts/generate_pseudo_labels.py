@@ -27,6 +27,7 @@ from src.ocr.hybrid_line_pick import run_hybrid_field_ocr
 from src.ocr.paddleocr_adapter import PaddleOCRRecognizer
 from src.ocr.utils import canonicalize_field_name, empty_ocr_result, looks_suspicious_for_field
 from src.ocr.vietocr_adapter import VietOCRRecognizer
+from src.parsing.vn_places import score_place_text
 
 LOGGER = logging.getLogger(__name__)
 HYBRID_FIELDS = {"place_of_origin", "place_of_residence"}
@@ -65,6 +66,44 @@ def review_bucket(confidence: float) -> str:
     if confidence >= 0.5:
         return "review"
     return "reject"
+
+
+def review_bucket_for_field(field_name: str | None, text: str, confidence: float) -> str:
+    canonical_field = canonicalize_field_name(field_name)
+    if canonical_field not in HYBRID_FIELDS:
+        return review_bucket(confidence)
+
+    cleaned = (text or "").strip()
+    if not cleaned:
+        return "reject"
+    if confidence < 0.5:
+        return "reject"
+    if looks_suspicious_for_field(cleaned, canonical_field):
+        return "reject" if confidence < 0.75 else "review"
+
+    matched, total, avg_place_conf = score_place_text(cleaned)
+    if total <= 0 or matched <= 0:
+        return "review"
+
+    match_ratio = matched / max(total, 1)
+    # Address/origin confidence is often over-optimistic. Only auto-accept
+    # near-exact gazetteer matches; noisy high-confidence rows stay review.
+    if (
+        confidence >= 0.93
+        and matched >= 2
+        and match_ratio >= 0.67
+        and avg_place_conf >= 0.98
+    ):
+        return "accept"
+    if (
+        canonical_field == "place_of_origin"
+        and confidence >= 0.94
+        and matched == 1
+        and total == 1
+        and avg_place_conf >= 0.999
+    ):
+        return "accept"
+    return "review"
 
 
 def read_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -163,6 +202,13 @@ def run_batch(
                 paddle_result = _pick_safer_result(field_name, paddle_result, hybrid_paddle_result)
 
         best_result = select_best_ocr_result(row.get("field_name"), viet_result, paddle_result)
+        canonical_field = canonicalize_field_name(row.get("field_name"))
+        bucket = review_bucket_for_field(
+            row.get("field_name"),
+            best_result.text,
+            float(best_result.confidence),
+        )
+        needs_review = bool(best_result.needs_review or (canonical_field in HYBRID_FIELDS and bucket != "accept"))
         output_rows.append(
             {
                 "crop_path": to_portable_path(crop_path, project_root),
@@ -182,8 +228,8 @@ def run_batch(
                 "best_conf": round(float(best_result.confidence), 4),
                 "best_engine": best_result.engine,
                 "best_source": best_result.engine,
-                "needs_review": bool(best_result.needs_review),
-                "review_bucket": review_bucket(float(best_result.confidence)),
+                "needs_review": needs_review,
+                "review_bucket": bucket,
             }
         )
 
