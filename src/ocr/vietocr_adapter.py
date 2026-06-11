@@ -18,6 +18,8 @@ LOGGER = logging.getLogger(__name__)
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 _FINETUNE_V2_CONFIG = _PROJECT_ROOT / "configs" / "vietocr_finetune_v2.yml"
 _FINETUNE_V2_WEIGHTS = _PROJECT_ROOT / "weights" / "vietocr_cccd_v2.pth"
+_ADDRESS_ORIGIN_REVIEWED_CONFIG = _PROJECT_ROOT / "configs" / "vietocr_address_origin_reviewed.yml"
+_ADDRESS_ORIGIN_REVIEWED_WEIGHTS = _PROJECT_ROOT / "weights" / "vietocr_cccd_address_origin_reviewed.pth"
 _ADDRESS_V1_CONFIG = _PROJECT_ROOT / "configs" / "vietocr_address_v1.yml"
 _ADDRESS_V1_WEIGHTS = _PROJECT_ROOT / "weights" / "vietocr_cccd_address_v1.pth"
 _FINETUNE_CONFIG = _PROJECT_ROOT / "configs" / "vietocr_finetune.yml"
@@ -97,6 +99,15 @@ class VietOCRRecognizer:
             config_path=_ADDRESS_V1_CONFIG,
             weights_path=_ADDRESS_V1_WEIGHTS,
             model_label="vietocr_address_v1",
+        )
+
+    @classmethod
+    def address_origin_reviewed(cls, device: str | None = None) -> "VietOCRRecognizer":
+        return cls(
+            device=device,
+            config_path=_ADDRESS_ORIGIN_REVIEWED_CONFIG,
+            weights_path=_ADDRESS_ORIGIN_REVIEWED_WEIGHTS,
+            model_label="vietocr_address_origin_reviewed",
         )
 
     def _load_predictor_from_files(self, Cfg: Any, Predictor: Any, config_path: Path, weights_path: Path) -> Any:

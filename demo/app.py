@@ -428,7 +428,14 @@ if st.button("Extract Information", use_container_width=True, type="primary"):
                 st.session_state.debug_bundle_dir = None
                 if save_debug_bundle:
                     st.session_state.debug_bundle_dir = str(_save_debug_bundle(image_path, result, debug_output_dir))
-                st.success("Processing complete!")
+                if result.errors:
+                    st.error("Processing stopped with errors. See details below.")
+                elif not result.card_detected:
+                    st.warning("Processing finished, but no card was detected.")
+                elif not result.ocr_results:
+                    st.warning("Processing finished, but no OCR fields were extracted.")
+                else:
+                    st.success("Processing complete!")
 
             except Exception as e:
                 st.error(f"Error: {e}")
@@ -446,6 +453,11 @@ if st.session_state.results:
         st.info("Live OCR (VietOCR)")
     if st.session_state.get("debug_bundle_dir"):
         st.caption(f"Debug bundle: {st.session_state.debug_bundle_dir}")
+
+    if result.errors:
+        st.error("Errors:\n" + "\n".join(f"- {err}" for err in result.errors))
+    if result.warnings:
+        st.warning("Warnings:\n" + "\n".join(f"- {warn}" for warn in result.warnings))
 
     col_img, col_table = st.columns(2)
 

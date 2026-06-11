@@ -9,11 +9,17 @@ import argparse
 import json
 import base64
 import os
+import sys
 from pathlib import Path
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 import threading
 import webbrowser
+
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
 
 # ── Load data ────────────────────────────────────────────────────────────────
 
@@ -367,9 +373,16 @@ function saveCurrentInput() {
   const val = inp.value.trim();
   const rec = FILTERED[CUR_IDX];
   rec.ground_truth_text = val;
+  rec.review_status = val ? 'verified' : (rec.review_status || 'pending');
   // sync back to ALL_RECORDS
-  const orig = ALL_RECORDS.find(r => r.ann_id === rec.ann_id && r.crop_path === rec.crop_path);
-  if (orig) orig.ground_truth_text = val;
+  const orig = ALL_RECORDS.find(r =>
+    (rec.group_key && r.group_key === rec.group_key) ||
+    (r.ann_id === rec.ann_id && r.crop_path === rec.crop_path)
+  );
+  if (orig) {
+    orig.ground_truth_text = val;
+    orig.review_status = rec.review_status;
+  }
 }
 
 // ── Render ──────────────────────────────────────────────────────────────────
@@ -440,7 +453,10 @@ function render() {
         <div class="meta-row" style="margin-top:12px">
           <div class="meta-item">class: <span>${rec.class || '?'}</span></div>
           <div class="meta-item">conf: <span style="color:${confColor(rec.best_conf)}">${((rec.best_conf||0)*100).toFixed(1)}%</span></div>
+          ${rec.group_size ? `<div class="meta-item">group: <span>${rec.group_size} crops</span></div>` : ''}
+          ${rec.review_status ? `<div class="meta-item">status: <span>${rec.review_status}</span></div>` : ''}
         </div>
+        ${rec.group_key ? `<div style="margin-top:8px;font-size:10px;color:var(--muted);font-family:var(--mono);word-break:break-all">group: ${rec.group_key}</div>` : ''}
         <div style="margin-top:8px;font-size:10px;color:var(--muted);font-family:var(--mono);word-break:break-all">${rec.crop_path || ''}</div>
       </div>
 
@@ -519,8 +535,15 @@ function accept() {
   if (!val) { showToast('Hãy nhập ground truth trước!', true); return; }
   const rec = FILTERED[CUR_IDX];
   rec.ground_truth_text = val;
-  const orig = ALL_RECORDS.find(r => r.crop_path === rec.crop_path);
-  if (orig) orig.ground_truth_text = val;
+  rec.review_status = 'verified';
+  const orig = ALL_RECORDS.find(r =>
+    (rec.group_key && r.group_key === rec.group_key) ||
+    r.crop_path === rec.crop_path
+  );
+  if (orig) {
+    orig.ground_truth_text = val;
+    orig.review_status = 'verified';
+  }
   updateStats();
   navigate(1);
 }
@@ -687,6 +710,8 @@ def main():
     parser.add_argument("--export", default="data/processed/ocr/reviewed_final.jsonl",
                         help="Path export file đã review xong")
     parser.add_argument("--port",   type=int, default=5000)
+    parser.add_argument("--no-open", action="store_true",
+                        help="Khong tu mo trinh duyet sau khi start server")
     args = parser.parse_args()
 
     input_path  = args.input
@@ -700,6 +725,17 @@ def main():
     records = load_records(input_path)
     # Chuyển đổi format pseudo_labels.jsonl sang format tool cần
     for idx, r in enumerate(records):
+        if not r.get("crop_path") and r.get("representative_crop_path"):
+            r["crop_path"] = r["representative_crop_path"]
+        if not r.get("class"):
+            r["class"] = r.get("field_name", "")
+        if not r.get("field_name"):
+            r["field_name"] = r.get("class", "")
+        if "review_status" not in r:
+            r["review_status"] = "verified" if r.get("ground_truth_text", "").strip() else "pending"
+        if "review_bucket" not in r:
+            r["review_bucket"] = r.get("review_status") or "pending"
+
         paddle_text = r.get("text_paddle")
         if paddle_text is None:
             paddle_text = r.get("text_paddleocr", "")
@@ -730,8 +766,6 @@ def main():
                 r["best_source"] = "paddleocr"
             else:
                 r["best_source"] = "vietocr"
-        if "field_name" not in r:
-            r["field_name"] = r.get("class", "")
         if "ann_id" not in r:
             r["ann_id"] = idx
     print(f"[INFO] Loaded {len(records)} records từ {input_path}")
@@ -753,7 +787,8 @@ def main():
     print(f"[INFO]  Export  : {export_path}")
     print(f"[INFO]  Nhấn Ctrl+C để dừng\n")
 
-    threading.Timer(1.0, lambda: webbrowser.open(url)).start()
+    if not args.no_open:
+        threading.Timer(1.0, lambda: webbrowser.open(url)).start()
     try:
         server.serve_forever()
     except KeyboardInterrupt:

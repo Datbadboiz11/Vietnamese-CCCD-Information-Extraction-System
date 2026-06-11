@@ -205,7 +205,7 @@ class CCCDPipeline:
         self._card_detector: Any = None
         self._field_detector: Any = None
         self._vietocr: VietOCRRecognizer | None = None
-        self._vietocr_address: VietOCRRecognizer | None = None
+        self._vietocr_address_origin: VietOCRRecognizer | None = None
         self._paddleocr: PaddleOCRRecognizer | None = None
         self._parser = CCCDParser()
 
@@ -226,14 +226,14 @@ class CCCDPipeline:
             self._vietocr = VietOCRRecognizer(device=self.device)
         return self._vietocr
 
-    def _get_vietocr_address(self) -> VietOCRRecognizer:
-        if self._vietocr_address is None:
-            self._vietocr_address = VietOCRRecognizer.address_v1(device=self.device)
-        return self._vietocr_address
+    def _get_vietocr_address_origin(self) -> VietOCRRecognizer:
+        if self._vietocr_address_origin is None:
+            self._vietocr_address_origin = VietOCRRecognizer.address_origin_reviewed(device=self.device)
+        return self._vietocr_address_origin
 
     def _get_vietocr_for_field(self, field_name: str | None) -> VietOCRRecognizer:
-        if field_name == "place_of_residence":
-            return self._get_vietocr_address()
+        if field_name in {"place_of_origin", "place_of_residence"}:
+            return self._get_vietocr_address_origin()
         return self._get_vietocr()
 
     def _get_paddleocr(self) -> PaddleOCRRecognizer:
@@ -482,6 +482,7 @@ class CCCDPipeline:
             debug_info: dict[str, Any] = {
                 "class_name": cls_name,
                 "canonical_field": canonical_field,
+                "vietocr_model": vietocr.model_label,
                 "detector_confidence": float(det_conf),
                 "crop_bbox_xyxy": [round(float(v), 2) for v in clamped.tolist()],
                 "crop_shape": list(crop.shape),
